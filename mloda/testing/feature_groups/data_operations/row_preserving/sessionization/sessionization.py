@@ -351,7 +351,6 @@ class SessionizationTestBase(ReservedColumnsTestMixin, DataOpsTestBase):
             "ts__sessionize_30_minute",
             options=Options(
                 context={
-                    "in_features": "ts",
                     "partition_by": ["user"],
                 }
             ),
@@ -391,19 +390,18 @@ class SessionizationTestBase(ReservedColumnsTestMixin, DataOpsTestBase):
         with pytest.raises(ValueError, match=r"(?i)ts|missing|column"):
             self.implementation_class().calculate_feature(data, fs)
 
-    def test_multi_column_in_features_rejected_at_calculate(self) -> None:
-        """calculate_feature must reject features with multiple in_features (MAX_IN_FEATURES=1)."""
+    def test_config_only_feature_rejected_at_calculate(self) -> None:
+        """calculate_feature must reject a config-only feature name (source must come from the name)."""
         feature = Feature(
-            "bad_multi_col",
+            "bad_config_only",
             options=Options(
                 context={
-                    "in_features": ["ts", "other_ts"],
+                    "in_features": "ts",
                     "partition_by": ["user"],
-                    "order_by": "ts",
                 }
             ),
         )
         fs = FeatureSet()
         fs.add(feature)
-        with pytest.raises(ValueError, match=r"(?i)at most 1|in_features|single"):
+        with pytest.raises(ValueError, match=r"(?i)feature name"):
             self.implementation_class().calculate_feature(self.test_data, fs)
