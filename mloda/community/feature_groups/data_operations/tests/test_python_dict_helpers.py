@@ -252,8 +252,21 @@ class TestReduceAgg:
     def test_max_skips_none_and_nan(self) -> None:
         assert reduce_agg("max", [float("nan"), None, 3.0, 1.0]) == pytest.approx(3.0)
 
-    def test_min_all_nan_returns_none(self) -> None:
-        assert reduce_agg("min", [float("nan"), float("nan")]) is None
+    def test_min_all_nan_returns_nan(self) -> None:
+        """An all-NaN (non-empty) group returns NaN, matching aggregation_helpers.aggregate."""
+        result = reduce_agg("min", [float("nan"), float("nan")])
+        assert result is not None and math.isnan(result)
+
+    def test_max_all_nan_returns_nan(self) -> None:
+        """An all-NaN (non-empty) group returns NaN, matching aggregation_helpers.aggregate."""
+        result = reduce_agg("max", [float("nan"), float("nan")])
+        assert result is not None and math.isnan(result)
+
+    def test_min_all_none_returns_none(self) -> None:
+        assert reduce_agg("min", [None, None]) is None
+
+    def test_max_all_none_returns_none(self) -> None:
+        assert reduce_agg("max", [None, None]) is None
 
     def test_first_and_last_skip_none(self) -> None:
         assert reduce_agg("first", [None, 5, 6]) == 5
@@ -261,6 +274,12 @@ class TestReduceAgg:
 
     def test_median_skips_none(self) -> None:
         assert reduce_agg("median", [None, 1.0, 2.0, 3.0]) == pytest.approx(2.0)
+
+    def test_median_skips_nan(self) -> None:
+        assert reduce_agg("median", [1.0, float("nan")]) == pytest.approx(1.0)
+
+    def test_median_all_nan_returns_none(self) -> None:
+        assert reduce_agg("median", [float("nan"), float("nan")]) is None
 
     def test_unsupported_agg_type_raises_value_error(self) -> None:
         with pytest.raises(ValueError):
@@ -299,13 +318,6 @@ class TestReduceAgg:
 
         result = reduce_agg("mode", values)
         assert result is not None and math.isnan(result), f"mode={result!r} != PyArrow oracle mode={oracle!r} (nan)"
-
-
-class TestReduceAggMedianDoesNotSkipNanDocumentedDivergence:
-    def test_median_of_value_and_nan_returns_nan(self) -> None:
-        """Documented divergence: median does not skip NaN like pandas' skipna median."""
-        result = reduce_agg("median", [1.0, float("nan")])
-        assert result is not None and math.isnan(result)
 
 
 class TestGroupKeyValueMergesSignedZeroDocumentedDivergence:

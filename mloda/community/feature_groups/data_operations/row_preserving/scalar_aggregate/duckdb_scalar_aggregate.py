@@ -9,6 +9,7 @@ from mloda_plugins.compute_framework.base_implementations.duckdb.duckdb_framewor
 from mloda_plugins.compute_framework.base_implementations.duckdb.duckdb_relation import DuckdbRelation
 from mloda_plugins.compute_framework.base_implementations.sql.sql_utils import quote_ident
 
+from mloda.community.feature_groups.data_operations.duckdb_helpers import median_wrapped_source
 from mloda.community.feature_groups.data_operations.errors import unsupported_agg_type_error
 from mloda.community.feature_groups.data_operations.mask_utils import build_sql_case_when
 from mloda.community.feature_groups.data_operations.row_preserving.scalar_aggregate.base import (
@@ -56,5 +57,6 @@ class DuckdbScalarAggregate(ScalarAggregateFeatureGroup):
         if mask_spec is not None:
             source_sql = build_sql_case_when(DuckDBFramework.mask_engine(), data, mask_spec, quoted_source)
 
-        result: DuckdbRelation = data.window(f"{agg_func}({source_sql})", feature_name)
+        agg_source = median_wrapped_source(data, source_col, source_sql, agg_type)
+        result: DuckdbRelation = data.window(f"{agg_func}({agg_source})", feature_name)
         return result
