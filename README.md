@@ -33,9 +33,21 @@ print(result[0])
 
 Every plugin is requested by feature name (usually `{column}__{operation}`) and runs on PyArrow, Pandas, Polars lazy, DuckDB, and SQLite, each backend checked against the PyArrow reference; per-plugin coverage is in the [framework support matrix](docs/guides/data-operation-patterns/framework-support-matrix.md). Swap `compute_frameworks` between `PyArrowTable`, `PandasDataFrame`, and `PolarsLazyDataFrame` as-is; `DuckDBFramework` and `SqliteFramework` also need a connection passed via `data_access_collection` ([stateful connections](docs/guides/compute-framework-patterns/03-stateful-connection.md)). See [Use an existing plugin](docs/guides/01-use-existing-plugin.md) for streaming, realtime, and column ordering.
 
+## Upgrading
+
+Upgrading with pip from a `mloda-community` release that still shipped the plugin code inside the bundle deletes the plugins' files, and `pip check` reports nothing (`uv` is not affected). After upgrading, reinstall with the extras you use; an extender left out of the command stays deleted:
+
+```bash
+pip install --force-reinstall "mloda-community[otel]"
+```
+
+Keep `mloda-community`, `mloda-enterprise` and any plugin installed on its own at the same version, and upgrade them together. The bundle pins the packages it owns exactly, so upgrading one alone leaves a version conflict that pip reports without stopping the install.
+
+The OTel and OpenLineage extenders now ship only through `mloda-community[otel]` / `[openlineage]` / `[all]`, or their own distributions: a bare `mloda-community` install contains neither, even if `opentelemetry-api` or `openlineage-python` is already installed.
+
 ## Plugins
 
-`mloda-community` bundles all plugins below. Each is also published on its own for minimal installs, with the backend as an extra (`pip install "mloda-community-ema[pandas]"`).
+`mloda-community` installs all plugins below in one go. Each also ships as its own distribution for a minimal install, with the backend as an extra (`pip install "mloda-community-ema[pandas]"`); the bundle pins each one to its own version, so its files come from exactly one installed distribution.
 
 | Plugin | Feature name | Guide |
 |--------|--------------|-------|
@@ -71,13 +83,13 @@ Options such as `partition_by` and `order_by`, plus the shared contracts, are in
 
 > **Note:** Only `mloda/enterprise/` and its PyPI package require a license. Everything else in this repository is Apache 2.0 (see [LICENSE](LICENSE)).
 
-`opentelemetry-api` and `openlineage-python` are optional now, behind the `[otel]`, `[openlineage]`, and `[all]` extras. When the dependency is missing, PluginLoader skips the entry point with a WARNING and plugin discovery never registers the extender; importing `OtelExtender` or `OpenLineageExtender` from the package still raises `ModuleNotFoundError`.
+`mloda-community-otel` and `mloda-community-openlineage` ship only through `mloda-community[otel]` / `[openlineage]` / `[all]`, or their own distributions; a bare `mloda-community` install contains neither. Each extra pulls in the extender's own distribution, which hard-depends on its third-party package (`opentelemetry-api`, `openlineage-python`). If that dependency is missing or broken anyway, PluginLoader skips the entry point with a WARNING instead of failing the rest of the bundle's entry-point loading; importing `OtelExtender` or `OpenLineageExtender` from the package still raises `ModuleNotFoundError`.
 
 `cryptography`, behind `[ed25519]`, behaves differently: the audit extender still loads without it, and only constructing `Ed25519Signer` raises `ImportError`. `opentelemetry-api`, behind `mloda-enterprise[otel]`, behaves the same way: only constructing `OtelLogAuditSink` raises `ImportError`.
 
 `mloda-community-openlineage`, behind `mloda-enterprise[openlineage]`, is what the lineage facets extender (`mloda-enterprise-lineage`) builds on; without the extra its entry point registers nothing.
 
-The remaining example packages are not on PyPI; install them from git, replacing the subdirectory with the package `path` from `config/packages.toml`:
+The remaining example packages are not released to PyPI and ship inside the bundles. To use one without its bundle, install it from git, replacing the subdirectory with the package `path` from `config/packages.toml`; next to the bundle it would own the same files twice:
 
 ```bash
 pip install "git+https://github.com/mloda-ai/mloda-registry.git#subdirectory=mloda/community/feature_groups/example/example_b"

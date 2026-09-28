@@ -155,16 +155,19 @@ jobs:
           # published. Which limiter fires is still unconfirmed, so upload one file at a
           # time with a pause between them rather than one batch `twine upload dist/*`.
           PYPI_UPLOAD_DELAY_SECONDS: '5'
-        # --skip-existing keeps a rerun after a partial upload from failing on files already on PyPI.
-        # --verbose so a 429 prints the response body and the RateLimit / RateLimit-Policy
-        # headers; without it twine reports a bare "Too Many Requests" that names no policy.
+        # Upload order is the published order (scripts/published_packages.py): dependencies first,
+        # bundles last, so a partial upload (e.g. a PyPI 429) always leaves an installable prefix,
+        # instead of the dist/* bash glob order, which could upload a bundle before a package it
+        # depends on. --skip-existing keeps a rerun after a partial upload from failing on files
+        # already on PyPI. --verbose so a 429 prints the response body and the RateLimit /
+        # RateLimit-Policy headers; without it twine reports a bare "Too Many Requests" that names
+        # no policy.
         run: |
-          shopt -s nullglob
-          dists=(dist/*)
-          if [ ${#dists[@]} -eq 0 ]; then
-            echo "::error ::No distributions found in dist/ to publish"
+          if ! wheels=$(python scripts/published_packages.py --wheels dist); then
+            echo "::error ::scripts/published_packages.py --wheels dist failed, see the message above"
             exit 1
           fi
+          mapfile -t dists <<<"$wheels"
 
           delay="${PYPI_UPLOAD_DELAY_SECONDS:-5}"
           total=${#dists[@]}

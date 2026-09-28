@@ -5,6 +5,7 @@ version setuptools normalizes into the filename may decide which wheel a package
 from __future__ import annotations
 
 import shutil
+import sys
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
@@ -16,6 +17,7 @@ from tests.script_loader import load_script
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _VERIFY_BUILDS_PATH = _REPO_ROOT / "scripts" / "verify_builds.py"
+_PUBLISHED_PACKAGES_PATH = _REPO_ROOT / "scripts" / "published_packages.py"
 
 _VERSION = "0.4.0"
 
@@ -29,6 +31,7 @@ _STALE_VERSION = "0.3.9"
 _REORDERED_NAMES = ["mloda-community-example", "mloda-community-offset", "mloda-community", "mloda-registry"]
 
 vb = load_script("verify_builds", _VERIFY_BUILDS_PATH)
+pp = load_script("published_packages", _PUBLISHED_PACKAGES_PATH)
 
 
 def _find_wheels() -> Callable[[Path, str], list[Path]]:
@@ -65,6 +68,27 @@ def _write_wheel(out_dir: Path, pkg_name: str, version: str = _VERSION) -> Path:
     dist_info = f"{pkg_name.replace('-', '_')}-{version}.dist-info"
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr(f"{dist_info}/METADATA", f"Metadata-Version: 2.4\nName: {pkg_name}\nVersion: {version}\n")
+    return path
+
+
+def _write_wheel_with_files(out_dir: Path, pkg_name: str, files: list[str], version: str = _VERSION) -> Path:
+    """Like ``_write_wheel``, but the zip also carries the given (already wheel-relative) file paths."""
+    path = out_dir / _wheel_name(pkg_name, version)
+    dist_info = f"{pkg_name.replace('-', '_')}-{version}.dist-info"
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr(f"{dist_info}/METADATA", f"Metadata-Version: 2.4\nName: {pkg_name}\nVersion: {version}\n")
+        for file_path in files:
+            zf.writestr(file_path, "")
+    return path
+
+
+def _write_wheel_with_metadata(out_dir: Path, pkg_name: str, extra_lines: list[str], version: str = _VERSION) -> Path:
+    """Like ``_write_wheel``, but the METADATA carries the given additional lines (extras, requires-dist)."""
+    path = out_dir / _wheel_name(pkg_name, version)
+    dist_info = f"{pkg_name.replace('-', '_')}-{version}.dist-info"
+    lines = ["Metadata-Version: 2.4", f"Name: {pkg_name}", f"Version: {version}", *extra_lines]
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr(f"{dist_info}/METADATA", "\n".join(lines) + "\n")
     return path
 
 
@@ -221,6 +245,59 @@ def test_a_normalized_wheel_version_is_diagnosed_as_a_version_mismatch(
     assert exit_code == 1, f"main() must fail on a version mismatch, returned {exit_code!r}"
 
 
+def _verify_published_wheels_have_a_single_owner() -> Callable[[dict[str, Path], list[str]], list[str]]:
+    """The published-pair overlap check verify_builds must expose, replacing verify_shared_wheel_has_single_owner."""
+    verify: Callable[[dict[str, Path], list[str]], list[str]] | None = getattr(
+        vb, "verify_published_wheels_have_a_single_owner", None
+    )
+    assert callable(verify), "verify_builds.verify_published_wheels_have_a_single_owner must be a callable"
+    return verify
+
+
+def test_overlap_between_two_published_wheels_is_reported(tmp_path: Path) -> None:
+    """A path shipped by two published wheels' file lists is a single-owner violation."""
+    verify = _verify_published_wheels_have_a_single_owner()
+    shared_path = "mloda/community/extenders/shared/foo.py"
+    bundle = _write_wheel_with_files(tmp_path, "mloda-community", ["mloda/community/py.typed", shared_path])
+    shared = _write_wheel_with_files(tmp_path, "mloda-community-extenders-shared", [shared_path])
+    wheels = {"mloda-community": bundle, "mloda-community-extenders-shared": shared}
+
+    errors = verify(wheels, ["mloda-community", "mloda-community-extenders-shared"])
+
+    assert any(shared_path in error for error in errors), (
+        f"expected an overlap error naming {shared_path!r}, got {errors!r}"
+    )
+
+
+def test_overlap_check_ignores_dist_info_entries(tmp_path: Path) -> None:
+    """Every wheel's own dist-info carries files (RECORD, METADATA, ...); those must never count as overlap."""
+    verify = _verify_published_wheels_have_a_single_owner()
+    # Same literal dist-info-relative path in both wheels, to isolate the ignore rule from real dist-info naming.
+    shared_dist_info_path = "shared.dist-info/RECORD"
+    one = _write_wheel_with_files(tmp_path, "mloda-registry", [shared_dist_info_path])
+    other = _write_wheel_with_files(tmp_path, "mloda-testing", [shared_dist_info_path])
+    wheels = {"mloda-registry": one, "mloda-testing": other}
+
+    errors = verify(wheels, ["mloda-registry", "mloda-testing"])
+
+    assert errors == [], f"a shared *.dist-info/ entry must never be reported as an overlap, got {errors!r}"
+
+
+def test_overlap_check_ignores_an_unpublished_wheel(tmp_path: Path) -> None:
+    """An overlap that involves a wheel outside the published set must not be reported."""
+    verify = _verify_published_wheels_have_a_single_owner()
+    shared_path = "mloda/community/extenders/shared/foo.py"
+    bundle = _write_wheel_with_files(tmp_path, "mloda-community", [shared_path])
+    unpublished = _write_wheel_with_files(tmp_path, "mloda-community-example-b", [shared_path])
+    wheels = {"mloda-community": bundle, "mloda-community-example-b": unpublished}
+
+    errors = verify(wheels, ["mloda-community"])
+
+    assert errors == [], (
+        f"an overlap with an unpublished wheel must be ignored, {shared_path!r} must not be reported: {errors!r}"
+    )
+
+
 def test_two_wheels_for_one_distribution_are_rejected_as_ambiguous(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -237,3 +314,200 @@ def test_two_wheels_for_one_distribution_are_rejected_as_ambiguous(
     for candidate in (_wheel_name("mloda-registry"), _wheel_name("mloda-registry", _STALE_VERSION)):
         assert candidate in output, f"main() must name the ambiguous candidate {candidate}, printed:\n{output}"
     assert exit_code == 1, f"main() must fail when one distribution has two wheels, returned {exit_code!r}"
+
+
+def test_community_example_wheel_without_example_b_in_the_all_extra_reports_no_error(tmp_path: Path) -> None:
+    """example-b drops out of the 'all' extra (config/packages.toml), so a wheel that reflects that must
+    not be flagged: verify_dependency_relationships must stop requiring example-b in the extra."""
+    wheel = _write_wheel_with_metadata(
+        tmp_path,
+        "mloda-community-example",
+        ["Provides-Extra: all", 'Requires-Dist: mloda-community-example-a; extra == "all"'],
+    )
+
+    errors = vb.verify_dependency_relationships({"mloda-community-example": wheel})
+
+    assert errors == [], f"a wheel whose 'all' extra lists only example-a must report no error, got {errors!r}"
+
+
+def _published_wheels() -> Callable[[dict[str, dict[str, Any]], Path], list[Path]]:
+    """The one-wheel-per-published-distribution matcher published_packages.py must expose."""
+    fn: Callable[[dict[str, dict[str, Any]], Path], list[Path]] | None = getattr(pp, "published_wheels", None)
+    assert callable(fn), "published_packages.published_wheels(packages, out_dir) must be a callable"
+    return fn
+
+
+def test_published_wheels_follows_published_order_not_filename_order(tmp_path: Path) -> None:
+    """The returned list order is the published (config) order, not the filename/glob order on disk."""
+    packages: dict[str, dict[str, Any]] = {
+        "mloda-testing": {"description": "sandbox", "path": "mloda/testing", "published": True},
+        "mloda-registry": {"description": "sandbox", "path": "mloda/registry", "published": True},
+    }
+    # Filenames sort mloda-registry before mloda-testing, the reverse of the published (config) order above.
+    _write_wheel(tmp_path, "mloda-registry")
+    _write_wheel(tmp_path, "mloda-testing")
+
+    wheels = _published_wheels()(packages, tmp_path)
+
+    expected = [_wheel_name("mloda-testing"), _wheel_name("mloda-registry")]
+    assert [w.name for w in wheels] == expected, (
+        f"published_wheels() returned {[w.name for w in wheels]!r}, expected published order {expected!r}"
+    )
+
+
+def test_published_wheels_never_matches_a_prefix_sibling(tmp_path: Path) -> None:
+    """A prefix sibling on disk (e.g. mloda-community-offset) must never satisfy mloda-community."""
+    packages: dict[str, dict[str, Any]] = {
+        "mloda-community": {"description": "sandbox", "path": "mloda/community", "published": True},
+    }
+    own = _write_wheel(tmp_path, "mloda-community")
+    sibling = _write_wheel(tmp_path, "mloda-community-offset")
+
+    wheels = _published_wheels()(packages, tmp_path)
+
+    assert sibling not in wheels, f"published_wheels() matched the prefix sibling {sibling.name}"
+    assert wheels == [own], f"published_wheels() must match only {own.name}, got {[w.name for w in wheels]}"
+
+
+def test_published_wheels_raises_when_no_wheel_matches(tmp_path: Path) -> None:
+    """Zero matching wheels for a published package must raise, naming that package."""
+    packages: dict[str, dict[str, Any]] = {
+        "mloda-registry": {"description": "sandbox", "path": "mloda/registry", "published": True},
+    }
+
+    with pytest.raises(ValueError, match="mloda-registry"):
+        _published_wheels()(packages, tmp_path)
+
+
+def test_published_wheels_raises_when_two_wheels_match(tmp_path: Path) -> None:
+    """Two matching wheels for one published package (e.g. a stale wheel left in a reused out-dir) must
+    raise, naming that package, rather than silently picking one."""
+    packages: dict[str, dict[str, Any]] = {
+        "mloda-registry": {"description": "sandbox", "path": "mloda/registry", "published": True},
+    }
+    _write_wheel(tmp_path, "mloda-registry", _VERSION)
+    _write_wheel(tmp_path, "mloda-registry", _STALE_VERSION)
+
+    with pytest.raises(ValueError, match="mloda-registry"):
+        _published_wheels()(packages, tmp_path)
+
+
+def _write_packages_config(root: Path, body: str) -> None:
+    """A minimal config/packages.toml under ``root``, for driving published_packages.py's CLI."""
+    (root / "config").mkdir(parents=True, exist_ok=True)
+    (root / "config" / "packages.toml").write_text(body)
+
+
+def test_cli_wheels_prints_matched_wheel_paths_one_per_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--wheels DIR`` prints the matched wheel paths, one per line, in published order."""
+    _write_packages_config(
+        tmp_path,
+        '[packages.mloda-registry]\ndescription = "sandbox"\npath = "mloda/registry"\npublished = true\n',
+    )
+    wheel = _write_wheel(tmp_path, "mloda-registry")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["published_packages.py", "--wheels", str(tmp_path)])
+
+    main: Callable[[], int] | None = getattr(pp, "main", None)
+    assert callable(main), "published_packages.main must be a callable returning an exit code"
+    exit_code = main()
+
+    out = capsys.readouterr().out
+    assert exit_code == 0, f"'published_packages.py --wheels {tmp_path}' exited {exit_code!r}, expected 0"
+    assert out.strip().splitlines() == [str(wheel)], (
+        f"'published_packages.py --wheels {tmp_path}' printed {out!r}, expected exactly the matched wheel path"
+    )
+
+
+def test_cli_wheels_exits_non_zero_when_published_wheels_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A published_wheels() ValueError (no wheel found here) must become a non-zero exit with the reason on
+    stderr, not an uncaught traceback."""
+    _write_packages_config(
+        tmp_path,
+        '[packages.mloda-registry]\ndescription = "sandbox"\npath = "mloda/registry"\npublished = true\n',
+    )
+    # No wheel written: published_wheels() must raise, naming mloda-registry.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["published_packages.py", "--wheels", str(tmp_path)])
+
+    main: Callable[[], int] | None = getattr(pp, "main", None)
+    assert callable(main), "published_packages.main must be a callable returning an exit code"
+    try:
+        exit_code = main()
+    except SystemExit as exc:
+        exit_code = exc.code if isinstance(exc.code, int) else 1
+
+    err = capsys.readouterr().err
+    assert exit_code != 0, "published_packages.main() must exit non-zero when published_wheels() raises"
+    assert "mloda-registry" in err, f"stderr must name the offending package, got {err!r}"
+
+
+def _write_misordered_packages_config(root: Path) -> None:
+    """A published package naming a later-declared published sibling, both modes must report this cleanly."""
+    _write_packages_config(
+        root,
+        '[packages.pkg-a]\ndescription = "sandbox"\npath = "p/a"\npublished = true\n'
+        'dependencies = ["pkg-b>=1.0"]\n\n'
+        '[packages.pkg-b]\ndescription = "sandbox"\npath = "p/b"\npublished = true\n',
+    )
+
+
+@pytest.mark.parametrize("wheels_mode", [False, True], ids=["bare", "wheels"])
+def test_cli_reports_a_misordered_published_config_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], wheels_mode: bool
+) -> None:
+    """published_packages() raises ValueError for a mis-ordered config; main() must turn that into a clean
+    non-zero exit with the reason (naming both packages) on stderr, not an uncaught traceback, in both the
+    plain mode and '--wheels' mode."""
+    _write_misordered_packages_config(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    argv = ["published_packages.py", "--wheels", str(tmp_path)] if wheels_mode else ["published_packages.py"]
+    monkeypatch.setattr(sys, "argv", argv)
+
+    main: Callable[[], int] | None = getattr(pp, "main", None)
+    assert callable(main), "published_packages.main must be a callable returning an exit code"
+    try:
+        exit_code = main()
+    except SystemExit as exc:
+        exit_code = exc.code if isinstance(exc.code, int) else 1
+
+    err = capsys.readouterr().err
+    mode = "--wheels" if wheels_mode else "bare"
+    assert exit_code != 0, (
+        f"published_packages.main() ({mode} mode) must exit non-zero for a mis-ordered published config, "
+        "not raise an uncaught ValueError"
+    )
+    assert "pkg-a" in err and "pkg-b" in err, (
+        f"published_packages.main() ({mode} mode) must name both pkg-a and pkg-b on stderr, got {err!r}"
+    )
+
+
+def test_cli_wheels_exits_non_zero_when_nothing_is_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An empty published set would hand the release workflow an empty upload list; --wheels must fail
+    loudly too, not just the bare invocation."""
+    _write_packages_config(
+        tmp_path,
+        '[packages.mloda-registry]\ndescription = "sandbox"\npath = "mloda/registry"\n',
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["published_packages.py", "--wheels", str(tmp_path)])
+
+    main: Callable[[], int] | None = getattr(pp, "main", None)
+    assert callable(main), "published_packages.main must be a callable returning an exit code"
+    try:
+        exit_code = main()
+    except SystemExit as exc:
+        exit_code = exc.code if isinstance(exc.code, int) else 1
+
+    err = capsys.readouterr().err
+    assert exit_code != 0, (
+        "published_packages.main() must exit non-zero for '--wheels' when no package is flagged "
+        "'published = true', the same as the bare invocation"
+    )
+    assert err.strip(), "the reason must be printed on stderr, not silently swallowed"
