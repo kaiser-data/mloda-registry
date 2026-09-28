@@ -31,6 +31,11 @@ from mloda.testing.feature_groups.data_operations.helpers import (
 )
 from mloda.testing.feature_groups.data_operations.mixins.mask import MaskTestMixin
 from mloda.testing.feature_groups.data_operations.mixins.reserved_columns import ReservedColumnsTestMixin
+from mloda.testing.feature_groups.data_operations.mixins.single_value_std_var import (
+    SINGLE_VALUE_STD,
+    SINGLE_VALUE_VAR,
+    SingleValueStdVarTestMixin,
+)
 
 # ---------------------------------------------------------------------------
 # Expected values (module-level constants)
@@ -145,6 +150,21 @@ NAN_POLICY_FRAME_KINDS: dict[str, tuple[str, dict[str, list[float]]]] = {
 }
 
 
+# Single-value std/var (see SingleValueStdVarTestMixin): std/var over a window or
+# run holding exactly one value must be 0.0 (population, ddof=0), not null, evaluated
+# on the mixin's grp/ts/val fixture (grp A/A/A, ts=(Jan1, Jan10, Jan11); grp B, ts=Jan1).
+SINGLE_VALUE_STD_VAR_FRAME: dict[str, list[float]] = {
+    "std_3_day_window": [0.0, 0.0, 5.0, 0.0],
+    "var_3_day_window": [0.0, 0.0, 25.0, 0.0],
+    "std_rolling_3": [0.0, 5.0, SINGLE_VALUE_STD, 0.0],
+    "var_rolling_3": [0.0, 25.0, SINGLE_VALUE_VAR, 0.0],
+    "expanding_std": [0.0, 5.0, SINGLE_VALUE_STD, 0.0],
+    "expanding_var": [0.0, 25.0, SINGLE_VALUE_VAR, 0.0],
+    "cumstd": [0.0, 5.0, SINGLE_VALUE_STD, 0.0],
+    "cumvar": [0.0, 25.0, SINGLE_VALUE_VAR, 0.0],
+}
+
+
 # ---------------------------------------------------------------------------
 # Capability-probe option builders (shared across backend test modules)
 # ---------------------------------------------------------------------------
@@ -217,7 +237,7 @@ def _assert_values_with_nulls(actual: list[Any], expected: list[Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
-class FrameAggregateTestBase(ReservedColumnsTestMixin, MaskTestMixin, DataOpsTestBase):
+class FrameAggregateTestBase(SingleValueStdVarTestMixin, ReservedColumnsTestMixin, MaskTestMixin, DataOpsTestBase):
     """Abstract base class for frame aggregate framework tests."""
 
     # -- ReservedColumnsTestMixin configuration --------------------------------
@@ -288,6 +308,23 @@ class FrameAggregateTestBase(ReservedColumnsTestMixin, MaskTestMixin, DataOpsTes
     @classmethod
     def mask_no_mask_expected(cls) -> list[Any]:
         return list(EXPECTED_CUMSUM)
+
+    # -- SingleValueStdVarTestMixin configuration -------------------------------
+
+    @classmethod
+    def single_value_cases(cls) -> dict[str, Any]:
+        return SINGLE_VALUE_STD_VAR_FRAME
+
+    @classmethod
+    def single_value_feature_name(cls, case: str) -> str:
+        return f"val__{case}"
+
+    @classmethod
+    def single_value_feature_set(cls, feature_name: str) -> FeatureSet:
+        return make_feature_set(feature_name, ["grp"], "ts")
+
+    def single_value_skip_if_unsupported(self, case: str, agg_type: str, feature_name: str) -> None:
+        self._skip_if_frame_feature_unsupported(feature_name, ["grp"], "ts")
 
     @classmethod
     def reference_implementation_class(cls) -> Any:
