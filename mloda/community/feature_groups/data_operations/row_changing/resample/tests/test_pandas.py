@@ -23,3 +23,8 @@ class TestPandasResample(PandasTestMixin, ResampleTestBase):
     @classmethod
     def implementation_class(cls) -> Any:
         return PandasResample
+
+    @classmethod
+    def nan_divergent_agg_types(cls) -> frozenset[str]:
+        """pandas skips NaN in sum/mean/count and returns null for an all-NaN bucket."""
+        return frozenset({"sum", "mean", "count", "min", "max"})

@@ -19,9 +19,9 @@ import pytest
 from mloda.user import Options
 
 from mloda.testing.feature_groups.data_operations.base import DataOpsTestBase
-from mloda.testing.feature_groups.data_operations.helpers import extract_column as _extract_column
 from mloda.testing.feature_groups.data_operations.helpers import make_feature_set
 from mloda.testing.feature_groups.data_operations.mixins.mask import MaskTestMixin
+from mloda.testing.feature_groups.data_operations.mixins.nan_policy import NanPolicyTestMixin
 from mloda.testing.feature_groups.data_operations.mixins.reserved_columns import ReservedColumnsTestMixin
 from mloda.testing.feature_groups.data_operations.mixins.single_value_std_var import (
     SINGLE_VALUE_STD,
@@ -73,11 +73,18 @@ NAN_POLICY_WINDOW: dict[str, list[float]] = {
     "mode": [2.0, 2.0, 2.0, float("nan"), float("nan"), float("nan"), float("nan")],
     "min": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
     "max": [2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0],
+    "sum": [float("nan"), float("nan"), float("nan"), float("nan"), float("nan"), float("nan"), float("nan")],
+    "avg": [float("nan"), float("nan"), float("nan"), float("nan"), float("nan"), float("nan"), float("nan")],
+    "count": [3, 3, 3, 4, 4, 4, 4],
 }
-# Known per-backend divergence, pinned via nan_divergent_agg_types(): pandas' mode()
-# treats NaN as a distinct, dropped value rather than one counted value.
+# Known per-backend divergences, pinned via nan_divergent_agg_types(): pandas' mode()
+# drops NaN instead of counting it; pandas and SQLite can't tell NaN from null, so
+# both skip it in sum/avg/count.
 NAN_DIVERGENT_WINDOW: dict[str, list[float]] = {
     "mode": [2.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0],
+    "sum": [3.0, 3.0, 3.0, 4.0, 4.0, 4.0, 4.0],
+    "avg": [1.5, 1.5, 1.5, 2.0, 2.0, 2.0, 2.0],
+    "count": [2, 2, 2, 2, 2, 2, 2],
 }
 
 # Single-value std/var (see SingleValueStdVarTestMixin): grp A=[10,20,30] (population
@@ -93,7 +100,9 @@ SINGLE_VALUE_STD_VAR_WINDOW: dict[str, list[float]] = {
 # ---------------------------------------------------------------------------
 
 
-class WindowAggregationTestBase(SingleValueStdVarTestMixin, ReservedColumnsTestMixin, MaskTestMixin, DataOpsTestBase):
+class WindowAggregationTestBase(
+    NanPolicyTestMixin, SingleValueStdVarTestMixin, ReservedColumnsTestMixin, MaskTestMixin, DataOpsTestBase
+):
     """Abstract base class for window aggregation framework tests."""
 
     # -- ReservedColumnsTestMixin configuration --------------------------------
@@ -176,6 +185,20 @@ class WindowAggregationTestBase(SingleValueStdVarTestMixin, ReservedColumnsTestM
 
     @classmethod
     def single_value_feature_name(cls, case: str) -> str:
+        return f"val__{case}_window"
+
+    # -- NanPolicyTestMixin configuration ---------------------------------------
+
+    @classmethod
+    def nan_policy_cases(cls) -> dict[str, Any]:
+        return NAN_POLICY_WINDOW
+
+    @classmethod
+    def nan_policy_divergent_cases(cls) -> dict[str, Any]:
+        return NAN_DIVERGENT_WINDOW
+
+    @classmethod
+    def nan_policy_feature_name(cls, case: str) -> str:
         return f"val__{case}_window"
 
     @classmethod
@@ -902,31 +925,6 @@ class WindowAggregationTestBase(SingleValueStdVarTestMixin, ReservedColumnsTestM
             )
         )
         assert output_id == input_id
-
-    # -- NaN policy (median/mode/min/max) ------------------------------------
-    # The reference assertion pins the policy; ``nan_divergent_agg_types`` pins pandas'
-    # mode() divergence (the only backend divergence left).
-
-    @pytest.mark.parametrize("agg_type", sorted(NAN_POLICY_WINDOW), ids=sorted(NAN_POLICY_WINDOW))
-    def test_nan_policy_window(self, agg_type: str) -> None:
-        """median/mode/min/max of a NaN-mixed column, broadcast per grp."""
-        self._skip_if_unsupported(agg_type)
-        table = self.nan_policy_table()
-        feature_name = f"val__{agg_type}_window"
-        fs = make_feature_set(feature_name, ["grp"])
-
-        ref = self.reference_implementation_class().calculate_feature(table, fs)
-        ref_col = _extract_column(ref, feature_name)
-        assert ref_col == pytest.approx(NAN_POLICY_WINDOW[agg_type], nan_ok=True), f"reference: {ref_col!r}"
-
-        result = self.implementation_class().calculate_feature(self.create_test_data(table), fs)
-        result_col = self.extract_column(result, feature_name)
-        expected = (
-            NAN_DIVERGENT_WINDOW[agg_type]
-            if agg_type in self.nan_divergent_agg_types()
-            else NAN_POLICY_WINDOW[agg_type]
-        )
-        assert result_col == pytest.approx(expected, nan_ok=True), f"backend: {result_col!r}"
 
     def test_row_order_preserved_sum(self) -> None:
         """Original columns must remain in input row order after sum.

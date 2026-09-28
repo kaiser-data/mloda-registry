@@ -24,6 +24,7 @@ import pytest
 from mloda.testing.feature_groups.data_operations.base import DataOpsTestBase
 from mloda.testing.feature_groups.data_operations.helpers import extract_column, make_feature_set
 from mloda.testing.feature_groups.data_operations.mixins.mask import MaskTestMixin
+from mloda.testing.feature_groups.data_operations.mixins.nan_policy import NanPolicyTestMixin
 from mloda.testing.feature_groups.data_operations.mixins.single_value_std_var import (
     SINGLE_VALUE_STD,
     SINGLE_VALUE_VAR,
@@ -98,11 +99,18 @@ NAN_POLICY_AGG: dict[str, dict[Any, float]] = {
     "mode": {"A": 2.0, "B": float("nan")},
     "min": {"A": 1.0, "B": 1.0},
     "max": {"A": 2.0, "B": 3.0},
+    "sum": {"A": float("nan"), "B": float("nan")},
+    "avg": {"A": float("nan"), "B": float("nan")},
+    "count": {"A": 3, "B": 4},
 }
-# Known per-backend divergence, pinned via nan_divergent_agg_types(): pandas' mode()
-# treats NaN as a distinct, dropped value rather than one counted value.
+# Known per-backend divergences, pinned via nan_divergent_agg_types(): pandas' mode()
+# drops NaN instead of counting it; pandas and SQLite can't tell NaN from null, so
+# both skip it in sum/avg/count.
 NAN_DIVERGENT_AGG: dict[str, dict[Any, float]] = {
     "mode": {"A": 2.0, "B": 1.0},
+    "sum": {"A": 3.0, "B": 4.0},
+    "avg": {"A": 1.5, "B": 2.0},
+    "count": {"A": 2, "B": 2},
 }
 
 # (agg_type, needs_skip) for aggregations over the all-null ``score`` column.
@@ -138,7 +146,7 @@ def _build_result_map(
 # ---------------------------------------------------------------------------
 
 
-class AggregationTestBase(SingleValueStdVarTestMixin, MaskTestMixin, DataOpsTestBase):
+class AggregationTestBase(NanPolicyTestMixin, SingleValueStdVarTestMixin, MaskTestMixin, DataOpsTestBase):
     """Abstract base class for aggregation framework tests.
 
     Subclasses implement 5 abstract methods to wire up their framework,
@@ -239,6 +247,23 @@ class AggregationTestBase(SingleValueStdVarTestMixin, MaskTestMixin, DataOpsTest
     def single_value_extract_values(
         self, result: Any, feature_name: str, column: Callable[[Any, str], list[Any]]
     ) -> Any:
+        return _build_result_map(column(result, "grp"), column(result, feature_name))
+
+    # -- NanPolicyTestMixin configuration ---------------------------------------
+
+    @classmethod
+    def nan_policy_cases(cls) -> dict[str, Any]:
+        return NAN_POLICY_AGG
+
+    @classmethod
+    def nan_policy_divergent_cases(cls) -> dict[str, Any]:
+        return NAN_DIVERGENT_AGG
+
+    @classmethod
+    def nan_policy_feature_name(cls, case: str) -> str:
+        return f"val__{case}_agg"
+
+    def nan_policy_extract_values(self, result: Any, feature_name: str, column: Callable[[Any, str], list[Any]]) -> Any:
         return _build_result_map(column(result, "grp"), column(result, feature_name))
 
     # -- Reference implementation (for cross-framework comparison) -------------------
@@ -864,29 +889,6 @@ class AggregationTestBase(SingleValueStdVarTestMixin, MaskTestMixin, DataOpsTest
         assert result_map["B"] == 60
         assert result_map["C"] == 15
         assert result_map[None] == -10
-
-    # -- NaN policy (median/mode/min/max) ------------------------------------
-    # The reference assertion pins the policy; ``nan_divergent_agg_types`` pins pandas'
-    # mode() divergence (the only backend divergence left).
-
-    @pytest.mark.parametrize("agg_type", sorted(NAN_POLICY_AGG), ids=sorted(NAN_POLICY_AGG))
-    def test_nan_policy_agg(self, agg_type: str) -> None:
-        """median/mode/min/max of a NaN-mixed column, grouped by grp."""
-        self._skip_if_unsupported(agg_type)
-        table = self.nan_policy_table()
-        feature_name = f"val__{agg_type}_agg"
-        fs = make_feature_set(feature_name, ["grp"])
-
-        ref = self.reference_implementation_class().calculate_feature(table, fs)
-        ref_map = _build_result_map(extract_column(ref, "grp"), extract_column(ref, feature_name))
-        assert ref_map == pytest.approx(NAN_POLICY_AGG[agg_type], nan_ok=True), f"reference: {ref_map!r}"
-
-        result = self.implementation_class().calculate_feature(self.create_test_data(table), fs)
-        result_map = _build_result_map(self.extract_column(result, "grp"), self.extract_column(result, feature_name))
-        expected = (
-            NAN_DIVERGENT_AGG[agg_type] if agg_type in self.nan_divergent_agg_types() else NAN_POLICY_AGG[agg_type]
-        )
-        assert result_map == pytest.approx(expected, nan_ok=True), f"backend: {result_map!r}"
 
     # -- Signed-zero partition keys -------------------------------------------
 
