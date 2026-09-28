@@ -36,7 +36,7 @@ File: `mloda/community/feature_groups/data_operations/{category}/{your_op}/base.
 
 ```python
 from typing import Any
-from mloda.provider import FeatureGroup, FeatureSet
+from mloda.provider import FeatureChainParserMixin, FeatureGroup, FeatureSet
 from mloda.community.feature_groups.data_operations.base import assert_source_columns_present
 
 
@@ -46,14 +46,14 @@ YOUR_OPS = {
 }
 
 
-class YourOpFeatureGroup(FeatureGroup):
+class YourOpFeatureGroup(FeatureChainParserMixin, FeatureGroup):
     PREFIX_PATTERN = r".+__(op_a|op_b)$"
 
     @classmethod
     def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
         table = data
         for feature in features.features:
-            source_col = cls._extract_source_features(feature)[0]
+            source_col = cls._extract_single_source_feature(feature)
             assert_source_columns_present(data, [source_col])
             op = cls._extract_op(feature)
             table = cls._compute(table, feature.name, source_col, op)
@@ -72,7 +72,7 @@ The base class owns:
 - The shared `assert_source_columns_present` presence guard, called once per feature before any per-backend dtype guard.
 - Delegation to a per-framework `_compute` hook.
 
-Existing bases to crib from: `row_preserving/binning/base.py` (simple), `row_preserving/window_aggregation/base.py` (with `partition_by`/`order_by`/masks). They compose `FeatureChainParserMixin` to parse the suffix of the feature name; copy that detail verbatim from the closest existing base.
+Existing bases to crib from: `row_preserving/binning/base.py` (simple), `row_preserving/window_aggregation/base.py` (with `partition_by`/`order_by`/masks). They compose `FeatureChainParserMixin` to parse the suffix of the feature name; copy that detail verbatim from the closest existing base. Single-input ops use `_extract_single_source_feature` so the MIN/MAX in_features check lives in the core helper, not a per-op override.
 
 ---
 
@@ -230,7 +230,7 @@ A new case-parametrized test mixin inherits `CaseParametrizationTestMixin` (`mlo
 
 Every test base also mixes in `OutputContractTestMixin` (`mloda/testing/feature_groups/data_operations/mixins/output_contract.py`), which covers the result-type, row-count, and new-column checks that used to be hand-written per base. Override `output_contract_feature_set` (an instance method) to return the `FeatureSet` to exercise, and `output_contract_expected_row_count` when the op changes the row count (return the expected count for the test dataset).
 
-Every op test base also wires up `InputValidationTestMixin` (`mloda/testing/feature_groups/data_operations/mixins/input_validation.py`) and overrides `input_validation_cases()`, declaring each of `multi_column_in_features`, `missing_source_column`, and `empty_partition_by` as an `InputValidationCase` (feature name, context, `match`, and optionally a `table` for fresh test data), a reason string (skips with that reason), or `None` (does not apply to this op).
+Every op test base also wires up `InputValidationTestMixin` (`mloda/testing/feature_groups/data_operations/mixins/input_validation.py`) and overrides `input_validation_cases()`, declaring each of `multi_column_in_features`, `missing_source_column`, and `empty_partition_by` as an `InputValidationCase` (feature name, context, `match`, and optionally a `table` for fresh test data), a reason string (skips with that reason), or `None` (does not apply to this op). The `multi_column_in_features` case also drives the inherited `test_mixin_empty_in_features` zero-in_features check, so declare it as an `InputValidationCase` (config-based) or a reason string to skip.
 
 ---
 
