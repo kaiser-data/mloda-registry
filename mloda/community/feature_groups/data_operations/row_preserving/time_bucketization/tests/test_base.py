@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 from mloda.user import Feature, FeatureName, Options
@@ -183,7 +182,7 @@ class TestSingleColumnEnforcement:
         with pytest.raises(ValueError, match="at most 1"):
             instance.input_features(options, FeatureName("my_result"))
 
-    def test_extract_source_features_rejects_multiple_in_features(self) -> None:
+    def test_extract_single_source_feature_rejects_multiple_in_features(self) -> None:
         options = Options(
             context={
                 "bucket_op": "floor_1_day",
@@ -192,35 +191,7 @@ class TestSingleColumnEnforcement:
         )
         feature = Feature("my_result", options=options)
         with pytest.raises(ValueError, match="at most 1"):
-            TimeBucketizationFeatureGroup._extract_source_features(feature)
-
-    def test_extract_source_features_rejects_empty_in_features(self) -> None:
-        """Empty in_features must raise ValueError at the FG-level guard.
-
-        ``Options.get_in_features()`` itself rejects empty values today, so
-        end-to-end the user sees a ValueError. But the FG-level guard in
-        ``_extract_source_features`` does not enforce ``MIN_IN_FEATURES``:
-        if a caller hands back an empty frozenset (e.g. a future Options
-        relaxation, a custom Options subclass, or a non-Options path), the
-        function silently returns ``[]`` and ``calculate_feature`` then does
-        ``source_features[0]`` and raises a bare ``IndexError``.
-
-        We bypass the Options-layer guard with a mock to exercise the FG
-        contract directly: empty in_features must raise ValueError with the
-        same "at most"-style message as the multi-column case.
-        """
-        feature = Feature(
-            "my_result",
-            options=Options(
-                context={
-                    "bucket_op": "floor_1_day",
-                    "in_features": "placeholder",
-                }
-            ),
-        )
-        with patch.object(feature.options, "get_in_features", return_value=frozenset()):
-            with pytest.raises(ValueError, match=r"(?i)at least|source|in_features"):
-                TimeBucketizationFeatureGroup._extract_source_features(feature)
+            TimeBucketizationFeatureGroup._extract_single_source_feature(feature)
 
     def test_extract_source_features_returns_single_item_for_string_pattern(self) -> None:
         feature = Feature("timestamp__floor_1_day", options=Options())

@@ -42,8 +42,13 @@ from mloda.provider import FeatureSet
 from mloda.user import Feature, Options
 
 from mloda.testing.feature_groups.data_operations.base import DataOpsTestBase
+from mloda.testing.feature_groups.data_operations.helpers import assert_values_with_nulls, make_feature_set
 from mloda.testing.feature_groups.data_operations.helpers import extract_column as _extract_column
-from mloda.testing.feature_groups.data_operations.helpers import make_feature_set
+from mloda.testing.feature_groups.data_operations.mixins.input_validation import (
+    InputValidationCase,
+    InputValidationTestMixin,
+)
+from mloda.testing.feature_groups.data_operations.mixins.output_contract import OutputContractTestMixin
 
 # ---------------------------------------------------------------------------
 # Dedicated 8-row fixture (UTC timestamps)
@@ -207,7 +212,7 @@ EXPECTED_ROUND_1_DAY: list[Any] = [
 # ---------------------------------------------------------------------------
 
 
-class TimeBucketizationTestBase(DataOpsTestBase):
+class TimeBucketizationTestBase(InputValidationTestMixin, OutputContractTestMixin, DataOpsTestBase):
     """Abstract base class for time-bucketization framework tests.
 
     Subclasses combine this with a framework mixin (``PyArrowTestMixin``,
@@ -219,6 +224,11 @@ class TimeBucketizationTestBase(DataOpsTestBase):
     ``supported_ops`` classmethod reports the three op subtypes; framework
     test classes may override to a subset.
     """
+
+    # -- OutputContractTestMixin configuration ----------------------------------
+
+    def output_contract_feature_set(self) -> FeatureSet:
+        return make_feature_set("timestamp__floor_1_day")
 
     ALL_OPS = {"floor", "ceil", "round"}
 
@@ -239,24 +249,11 @@ class TimeBucketizationTestBase(DataOpsTestBase):
 
     # -- Setup: use the dedicated 8-row bucketization fixture ---------------
 
-    def setup_method(self) -> None:
-        """Override the canonical-fixture setup to use the dedicated 8-row table."""
-        super().setup_method()  # connections + canonical data (mostly unused)
-        self._arrow_table = _create_bucket_arrow_table()
-        self.test_data = self.create_test_data(self._arrow_table)
+    @classmethod
+    def source_arrow_table(cls) -> pa.Table:
+        return _create_bucket_arrow_table()
 
     # -- Per-op / per-unit pinned-value tests --------------------------------
-
-    def _assert_equal_with_nulls(self, actual: list[Any], expected: list[Any]) -> None:
-        assert len(actual) == len(expected), f"row count {len(actual)} != expected {len(expected)}"
-        for i, (a, e) in enumerate(zip(actual, expected)):
-            if e is None:
-                assert a is None, f"row {i}: expected None, got {a!r}"
-            else:
-                # Accept ISO strings from SQLite (TEXT-stored timestamps).
-                if isinstance(a, str):
-                    a = datetime.fromisoformat(a)
-                assert a == e, f"row {i}: {a!r} != {e!r}"
 
     def test_floor_5_minute(self) -> None:
         """``floor`` to 5-minute buckets. Row 2 (14:37:23) floors to 14:35:00."""
@@ -264,20 +261,20 @@ class TimeBucketizationTestBase(DataOpsTestBase):
         result = self.implementation_class().calculate_feature(self.test_data, fs)
         assert isinstance(result, self.get_expected_type())
         col = self.extract_column(result, "timestamp__floor_5_minute")
-        self._assert_equal_with_nulls(col, EXPECTED_FLOOR_5_MINUTE)
+        assert_values_with_nulls(col, EXPECTED_FLOOR_5_MINUTE, parse_iso=True)
 
     def test_floor_1_day(self) -> None:
         fs = make_feature_set("timestamp__floor_1_day")
         result = self.implementation_class().calculate_feature(self.test_data, fs)
         col = self.extract_column(result, "timestamp__floor_1_day")
-        self._assert_equal_with_nulls(col, EXPECTED_FLOOR_1_DAY)
+        assert_values_with_nulls(col, EXPECTED_FLOOR_1_DAY, parse_iso=True)
 
     def test_floor_1_week(self) -> None:
         """ISO-Monday-anchored week floor. Sun 2023-01-01 -> Mon 2022-12-26."""
         fs = make_feature_set("timestamp__floor_1_week")
         result = self.implementation_class().calculate_feature(self.test_data, fs)
         col = self.extract_column(result, "timestamp__floor_1_week")
-        self._assert_equal_with_nulls(col, EXPECTED_FLOOR_1_WEEK)
+        assert_values_with_nulls(col, EXPECTED_FLOOR_1_WEEK, parse_iso=True)
         # Explicit pin on the most surprising row.
         assert col[0] == datetime(2022, 12, 26, 0, 0, 0, tzinfo=timezone.utc)
 
@@ -285,19 +282,19 @@ class TimeBucketizationTestBase(DataOpsTestBase):
         fs = make_feature_set("timestamp__floor_1_month")
         result = self.implementation_class().calculate_feature(self.test_data, fs)
         col = self.extract_column(result, "timestamp__floor_1_month")
-        self._assert_equal_with_nulls(col, EXPECTED_FLOOR_1_MONTH)
+        assert_values_with_nulls(col, EXPECTED_FLOOR_1_MONTH, parse_iso=True)
 
     def test_floor_1_year(self) -> None:
         fs = make_feature_set("timestamp__floor_1_year")
         result = self.implementation_class().calculate_feature(self.test_data, fs)
         col = self.extract_column(result, "timestamp__floor_1_year")
-        self._assert_equal_with_nulls(col, EXPECTED_FLOOR_1_YEAR)
+        assert_values_with_nulls(col, EXPECTED_FLOOR_1_YEAR, parse_iso=True)
 
     def test_ceil_5_minute(self) -> None:
         fs = make_feature_set("timestamp__ceil_5_minute")
         result = self.implementation_class().calculate_feature(self.test_data, fs)
         col = self.extract_column(result, "timestamp__ceil_5_minute")
-        self._assert_equal_with_nulls(col, EXPECTED_CEIL_5_MINUTE)
+        assert_values_with_nulls(col, EXPECTED_CEIL_5_MINUTE, parse_iso=True)
 
     def test_ceil_1_day_idempotent_on_aligned(self) -> None:
         """``ceil(aligned, 1_day) == aligned`` for rows 0, 1, 5 (all midnight)."""
@@ -315,7 +312,7 @@ class TimeBucketizationTestBase(DataOpsTestBase):
         col = self.extract_column(result, "timestamp__ceil_1_day")
         assert col[2] == datetime(2023, 6, 16, 0, 0, 0, tzinfo=timezone.utc)
         # And full list:
-        self._assert_equal_with_nulls(col, EXPECTED_CEIL_1_DAY)
+        assert_values_with_nulls(col, EXPECTED_CEIL_1_DAY, parse_iso=True)
 
     def test_ceil_1_year_crosses_year_boundary(self) -> None:
         """Row 5 (2023-12-31 23:59:59) ceils up to 2024-01-01."""
@@ -323,14 +320,14 @@ class TimeBucketizationTestBase(DataOpsTestBase):
         result = self.implementation_class().calculate_feature(self.test_data, fs)
         col = self.extract_column(result, "timestamp__ceil_1_year")
         assert col[5] == datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-        self._assert_equal_with_nulls(col, EXPECTED_CEIL_1_YEAR)
+        assert_values_with_nulls(col, EXPECTED_CEIL_1_YEAR, parse_iso=True)
 
     def test_round_5_minute(self) -> None:
         """Sanity check round at 5-min granularity (no actual midpoint in fixture)."""
         fs = make_feature_set("timestamp__round_5_minute")
         result = self.implementation_class().calculate_feature(self.test_data, fs)
         col = self.extract_column(result, "timestamp__round_5_minute")
-        self._assert_equal_with_nulls(col, EXPECTED_ROUND_5_MINUTE)
+        assert_values_with_nulls(col, EXPECTED_ROUND_5_MINUTE, parse_iso=True)
 
     def test_round_10_minute_at_midpoint(self) -> None:
         """Row 4 (14:25:00) is exactly midpoint between 10-min buckets 14:20 and 14:30.
@@ -343,13 +340,13 @@ class TimeBucketizationTestBase(DataOpsTestBase):
         result = self.implementation_class().calculate_feature(self.test_data, fs)
         col = self.extract_column(result, "timestamp__round_10_minute")
         assert col[4] == datetime(2023, 6, 15, 14, 30, 0, tzinfo=timezone.utc)
-        self._assert_equal_with_nulls(col, EXPECTED_ROUND_10_MINUTE)
+        assert_values_with_nulls(col, EXPECTED_ROUND_10_MINUTE, parse_iso=True)
 
     def test_round_1_day(self) -> None:
         fs = make_feature_set("timestamp__round_1_day")
         result = self.implementation_class().calculate_feature(self.test_data, fs)
         col = self.extract_column(result, "timestamp__round_1_day")
-        self._assert_equal_with_nulls(col, EXPECTED_ROUND_1_DAY)
+        assert_values_with_nulls(col, EXPECTED_ROUND_1_DAY, parse_iso=True)
 
     # -- Cross-cutting semantics --------------------------------------------
 
@@ -385,22 +382,6 @@ class TimeBucketizationTestBase(DataOpsTestBase):
         assert sample.tzinfo is not None, f"expected tz-aware datetime, got naive {sample!r}"
         assert sample.utcoffset() == timedelta(0), f"expected UTC offset 0 (input was UTC), got {sample.utcoffset()!r}"
 
-    def test_output_rows_equal_input_rows(self) -> None:
-        fs = make_feature_set("timestamp__floor_1_day")
-        result = self.implementation_class().calculate_feature(self.test_data, fs)
-        assert self.get_row_count(result) == 8
-
-    def test_new_column_added(self) -> None:
-        fs = make_feature_set("timestamp__floor_1_day")
-        result = self.implementation_class().calculate_feature(self.test_data, fs)
-        col = self.extract_column(result, "timestamp__floor_1_day")
-        assert len(col) == 8
-
-    def test_result_has_correct_type(self) -> None:
-        fs = make_feature_set("timestamp__floor_1_day")
-        result = self.implementation_class().calculate_feature(self.test_data, fs)
-        assert isinstance(result, self.get_expected_type())
-
     def test_option_based_floor(self) -> None:
         """Option-based configuration (no string pattern) produces the same result."""
         feature = Feature(
@@ -416,7 +397,7 @@ class TimeBucketizationTestBase(DataOpsTestBase):
         fs.add(feature)
         result = self.implementation_class().calculate_feature(self.test_data, fs)
         col = self.extract_column(result, "my_floored")
-        self._assert_equal_with_nulls(col, EXPECTED_FLOOR_1_DAY)
+        assert_values_with_nulls(col, EXPECTED_FLOOR_1_DAY, parse_iso=True)
 
     # -- Cross-framework comparison -----------------------------------------
 
@@ -520,40 +501,24 @@ class TimeBucketizationTestBase(DataOpsTestBase):
             f"Expected source column 'name' to be named in the error, got: {exc_info.value!r}"
         )
 
-    def test_missing_source_column_raises_value_error(self) -> None:
-        """All backends must raise ValueError (not KeyError or silent SQL error) when source col is absent.
+    # -- InputValidationTestMixin configuration ---------------------------------
 
-        Today the behaviour diverges by backend:
-        - DuckDB / SQLite: ``_assert_source_column_is_timestamp`` looks up a
-          dtype map keyed on the column name; the missing key gives ``None``
-          which fails the timestamp check silently (returns early), letting
-          downstream SQL raise an opaque engine error.
-        - Polars: ``data.collect_schema()[source_col]`` raises ``KeyError``.
-        - Pandas: ``data[source_col]`` raises ``KeyError``.
-        - PyArrow: ``data.column(source_col)`` raises ``KeyError`` /
-          ``ArrowKeyError``.
-
-        We want every backend to raise a clear ``ValueError`` naming the
-        missing column.
-        """
-        other_table = pa.table({"not_timestamp": pa.array([1, 2, 3], type=pa.int64())})
-        data = self.create_test_data(other_table)
-        fs = make_feature_set("timestamp__floor_1_day")
-        with pytest.raises(ValueError, match=r"(?i)timestamp|missing|column"):
-            self.implementation_class().calculate_feature(data, fs)
-
-    def test_multi_column_in_features_rejected_at_calculate(self) -> None:
-        """calculate_feature must reject features with multiple in_features."""
-        feature = Feature(
-            "bad_multi_col",
-            options=Options(
-                context={
-                    "bucket_op": "floor_1_day",
-                    "in_features": ["timestamp", "other_ts"],
-                }
+    @classmethod
+    def input_validation_cases(cls) -> dict[str, Any]:
+        missing_timestamp_table = pa.table({"not_timestamp": pa.array([1, 2, 3], type=pa.int64())})
+        return {
+            "multi_column_in_features": InputValidationCase(
+                "bad_multi_col",
+                {"bucket_op": "floor_1_day", "in_features": ["timestamp", "other_ts"]},
+                "at most 1",
             ),
-        )
-        fs = FeatureSet()
-        fs.add(feature)
-        with pytest.raises(ValueError, match="at most 1"):
-            self.implementation_class().calculate_feature(self.test_data, fs)
+            "missing_source_column": InputValidationCase(
+                "timestamp__floor_1_day",
+                {},
+                "Source column 'timestamp' is not present",
+                table=missing_timestamp_table,
+            ),
+            "empty_partition_by": None,
+            "missing_partition_by_column": None,
+            "missing_order_by_column": None,
+        }

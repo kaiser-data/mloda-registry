@@ -13,7 +13,6 @@ small set of abstract methods. This follows the same pattern as
 
 from __future__ import annotations
 
-import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -22,15 +21,23 @@ import pytest
 from mloda.provider import FeatureSet
 from mloda.user import Feature, Options
 
+from mloda.testing.data_creator.pyarrow import PyArrowDataOpsTestDataCreator
 from mloda.testing.feature_groups.data_operations.base import DataOpsTestBase
+from mloda.testing.feature_groups.data_operations.helpers import (
+    assert_values_with_nulls,
+    is_null,
+    make_feature_set,
+)
 from mloda.testing.feature_groups.data_operations.helpers import (
     extract_column as _extract_column,
 )
-from mloda.testing.feature_groups.data_operations.helpers import (
-    make_feature_set,
+from mloda.testing.feature_groups.data_operations.mixins.input_validation import (
+    InputValidationCase,
+    InputValidationTestMixin,
 )
 from mloda.testing.feature_groups.data_operations.mixins.mask import MaskTestMixin
 from mloda.testing.feature_groups.data_operations.mixins.nan_policy import NanPolicyTestMixin
+from mloda.testing.feature_groups.data_operations.mixins.output_contract import OutputContractTestMixin
 from mloda.testing.feature_groups.data_operations.mixins.reserved_columns import ReservedColumnsTestMixin
 from mloda.testing.feature_groups.data_operations.mixins.single_value_std_var import (
     SINGLE_VALUE_STD,
@@ -253,38 +260,64 @@ def config_frame_options(agg_type: str, frame_type: str, frame_size: int = 3) ->
 
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _is_null(value: Any) -> bool:
-    """Check if a value is null (None or NaN)."""
-    if value is None:
-        return True
-    if isinstance(value, float) and math.isnan(value):
-        return True
-    return False
-
-
-def _assert_values_with_nulls(actual: list[Any], expected: list[Any]) -> None:
-    """Assert two lists are equal, treating None and NaN as equivalent nulls."""
-    assert len(actual) == len(expected), f"length {len(actual)} != {len(expected)}"
-    for i, (a, e) in enumerate(zip(actual, expected)):
-        if _is_null(e):
-            assert _is_null(a), f"row {i}: expected null, got {a}"
-        else:
-            assert a == pytest.approx(e, rel=1e-6), f"row {i}: {a} != {e}"
-
-
-# ---------------------------------------------------------------------------
 # Reusable test base class
 # ---------------------------------------------------------------------------
 
 
 class FrameAggregateTestBase(
-    NanPolicyTestMixin, SingleValueStdVarTestMixin, ReservedColumnsTestMixin, MaskTestMixin, DataOpsTestBase
+    InputValidationTestMixin,
+    OutputContractTestMixin,
+    NanPolicyTestMixin,
+    SingleValueStdVarTestMixin,
+    ReservedColumnsTestMixin,
+    MaskTestMixin,
+    DataOpsTestBase,
 ):
     """Abstract base class for frame aggregate framework tests."""
+
+    # -- OutputContractTestMixin configuration ----------------------------------
+
+    def output_contract_feature_set(self) -> FeatureSet:
+        return make_feature_set("value_int__sum_rolling_3", ["region"], "value_int")
+
+    # -- InputValidationTestMixin configuration ---------------------------------
+
+    @classmethod
+    def input_validation_cases(cls) -> dict[str, Any]:
+        return {
+            # order_by is set because the config path checks it before the in_features count.
+            "multi_column_in_features": InputValidationCase(
+                "bad_multi",
+                {
+                    "aggregation_type": "sum",
+                    "frame_type": "rolling",
+                    "frame_size": 3,
+                    "partition_by": ["region"],
+                    "order_by": "value_int",
+                    "in_features": ["value_int", "value_float"],
+                },
+                "at most 1",
+            ),
+            "missing_source_column": InputValidationCase(
+                "value_int__sum_rolling_3",
+                # order_by is "amount" so it stays present once the source column is dropped.
+                {"partition_by": ["region"], "order_by": "amount"},
+                "Source column 'value_int' is not present",
+                table=PyArrowDataOpsTestDataCreator.create().drop_columns(["value_int"]),
+            ),
+            # partition_by=[] means one whole-table group; every backend must support it.
+            "empty_partition_by": None,
+            "missing_partition_by_column": InputValidationCase(
+                "value_int__sum_rolling_3",
+                {"partition_by": ["no_such_col"], "order_by": "amount"},
+                "partition_by 'no_such_col' is not present",
+            ),
+            "missing_order_by_column": InputValidationCase(
+                "value_int__sum_rolling_3",
+                {"partition_by": ["region"], "order_by": "no_such_col"},
+                "order_by 'no_such_col' is not present",
+            ),
+        }
 
     # -- ReservedColumnsTestMixin configuration --------------------------------
 
@@ -492,22 +525,6 @@ class FrameAggregateTestBase(
         result_col = self.extract_column(result, "value_int__expanding_avg")
         assert result_col == pytest.approx(EXPECTED_EXPANDING_AVG, rel=1e-3)
 
-    # -- Row preservation ----------------------------------------------------
-
-    def test_output_rows_equal_input_rows(self) -> None:
-        """Output must have exactly 12 rows, same as input."""
-        fs = make_feature_set("value_int__sum_rolling_3", ["region"], "value_int")
-        result = self.implementation_class().calculate_feature(self.test_data, fs)
-
-        assert self.get_row_count(result) == 12
-
-    def test_result_has_correct_type(self) -> None:
-        """The result of calculate_feature must be the expected framework type."""
-        fs = make_feature_set("value_int__cumsum", ["region"], "value_int")
-        result = self.implementation_class().calculate_feature(self.test_data, fs)
-
-        assert isinstance(result, self.get_expected_type())
-
     # -- Time window support tests -------------------------------------------
 
     def test_time_frame_match_rejected_when_unsupported(self) -> None:
@@ -644,7 +661,7 @@ class FrameAggregateTestBase(
         #   Masked: (null[Y], 15[X], null[Y]) -> cumsum: null, 15, 15
         # None group: (-10) = row 11 -> cumsum: -10
         expected = [10, None, 0, 10, 60, None, None, 60, None, 15, 15, -10]
-        _assert_values_with_nulls(result_col, expected)
+        assert_values_with_nulls(result_col, expected, nan_is_null=True, approx=True)
 
     def test_mask_rolling_sum_equal(self) -> None:
         """Rolling sum (window 3) where category='X', partitioned by region, ordered by value_int."""
@@ -662,35 +679,58 @@ class FrameAggregateTestBase(
         #   Masked: (null, 15, null) -> rolling_3 sum: null, 15, 15
         # None group: (-10) = row 11 -> -10
         expected = [10, None, 0, 10, 60, None, None, 60, None, 15, 15, -10]
-        _assert_values_with_nulls(result_col, expected)
+        assert_values_with_nulls(result_col, expected, nan_is_null=True, approx=True)
 
     # -- Cross-framework comparison ------------------------------------------
 
-    def test_cross_framework_rolling_sum(self) -> None:
-        """Rolling sum must match reference."""
-        self._compare_with_reference("value_int__sum_rolling_3", partition_by=["region"], order_by="value_int")
+    # -- Cross-framework parity across partition_by=["region"] and partition_by=[] ----
 
-    def test_cross_framework_cumsum(self) -> None:
-        """Cumulative sum must match reference."""
-        self._compare_with_reference("value_int__cumsum", partition_by=["region"], order_by="value_int")
+    @pytest.mark.parametrize("partition_by", [["region"], []], ids=["region", "global"])
+    def test_cross_framework_rolling_sum(self, partition_by: list[str]) -> None:
+        """Rolling sum must match reference, whole-table (partition_by=[]) included."""
+        self._compare_with_reference("value_int__sum_rolling_3", partition_by=partition_by, order_by="value_int")
 
-    def test_cross_framework_expanding_avg(self) -> None:
-        """Expanding avg must match reference."""
+    @pytest.mark.parametrize("partition_by", [["region"], []], ids=["region", "global"])
+    def test_cross_framework_cumsum(self, partition_by: list[str]) -> None:
+        """Cumulative sum must match reference, whole-table (partition_by=[]) included."""
+        self._compare_with_reference("value_int__cumsum", partition_by=partition_by, order_by="value_int")
+
+    @pytest.mark.parametrize("partition_by", [["region"], []], ids=["region", "global"])
+    def test_cross_framework_expanding_avg(self, partition_by: list[str]) -> None:
+        """Expanding avg must match reference, whole-table (partition_by=[]) included."""
         self._compare_with_reference(
-            "value_int__expanding_avg", partition_by=["region"], order_by="value_int", use_approx=True
+            "value_int__expanding_avg", partition_by=partition_by, order_by="value_int", use_approx=True
         )
 
-    def test_cross_framework_rolling_avg(self) -> None:
-        """Rolling avg must match reference."""
+    @pytest.mark.parametrize("partition_by", [["region"], []], ids=["region", "global"])
+    def test_cross_framework_rolling_avg(self, partition_by: list[str]) -> None:
+        """Rolling avg must match reference, whole-table (partition_by=[]) included."""
         self._compare_with_reference(
-            "value_int__avg_rolling_2", partition_by=["region"], order_by="value_int", use_approx=True
+            "value_int__avg_rolling_2", partition_by=partition_by, order_by="value_int", use_approx=True
         )
 
-    def test_cross_framework_time_window_day(self) -> None:
-        """A 3-day time window must match the reference on integer sums."""
+    @pytest.mark.parametrize("agg_type", ["std", "var"])
+    @pytest.mark.parametrize("partition_by", [["region"], []], ids=["region", "global"])
+    def test_cross_framework_cumulative_std_var(self, partition_by: list[str], agg_type: str) -> None:
+        """Cumulative std/var must match reference, whole-table (partition_by=[]) included."""
+        feature_name = f"value_int__cum{agg_type}"
+        self._skip_if_frame_feature_unsupported(feature_name, partition_by, "value_int")
+        self._compare_with_reference(feature_name, partition_by=partition_by, order_by="value_int", use_approx=True)
+
+    def test_match_accepts_empty_partition_by(self) -> None:
+        options = Options(context={"partition_by": [], "order_by": "value_int"})
+        assert self.implementation_class().match_feature_group_criteria("value_int__cumsum", options)
+
+    @pytest.mark.parametrize("partition_by", [["region"], []], ids=["region", "global"])
+    def test_cross_framework_time_window_day(self, partition_by: list[str]) -> None:
+        """A 3-day time window must match the reference on integer sums.
+
+        Regions interleave (A/B/A/B/A) so partition_by=[] is not indistinguishable
+        from partition_by=["region"]: the global window can span both regions.
+        """
         table = pa.table(
             {
-                "region": ["A", "A", "A", "A", "A"],
+                "region": ["A", "B", "A", "B", "A"],
                 "ts": [
                     datetime(2023, 1, 1, tzinfo=timezone.utc),
                     datetime(2023, 1, 3, tzinfo=timezone.utc),
@@ -705,7 +745,7 @@ class FrameAggregateTestBase(
         feature_name = "value__sum_3_day_window"
         feature = Feature(
             feature_name,
-            options=Options(context={"partition_by": ["region"], "order_by": "ts"}),
+            options=Options(context={"partition_by": partition_by, "order_by": "ts"}),
         )
         fs = FeatureSet()
         fs.add(feature)
@@ -713,6 +753,7 @@ class FrameAggregateTestBase(
         result = self.implementation_class().calculate_feature(data, fs)
         ref = self.reference_implementation_class().calculate_feature(table, fs)
 
+        assert self.get_row_count(result) == 5
         result_col = self.extract_column(result, feature_name)
         ref_col = _extract_column(ref, feature_name)
         assert result_col == ref_col
@@ -964,10 +1005,11 @@ class FrameAggregateTestBase(
         ],
     )
     @pytest.mark.parametrize("agg_type", ["sum", "avg", "min", "max", "count"])
+    @pytest.mark.parametrize("partition_by", [["region"], []], ids=["region", "global"])
     def test_cross_framework_time_window_with_mask(
-        self, table: pa.Table, mask_spec: tuple[Any, ...], agg_type: str
+        self, table: pa.Table, mask_spec: tuple[Any, ...], agg_type: str, partition_by: list[str]
     ) -> None:
-        """A masked time window must match the reference for every supported aggregation type."""
+        """A masked time window must match the reference, whole-table (partition_by=[]) included."""
         if "time" not in self.supported_frame_types():
             pytest.skip("This framework does not support time frames")
 
@@ -975,7 +1017,7 @@ class FrameAggregateTestBase(
         feature_name = f"value__{agg_type}_3_day_window"
         fs = make_feature_set(
             feature_name,
-            partition_by=["region"],
+            partition_by=partition_by,
             order_by="ts",
             mask=mask_spec,
         )
@@ -1001,7 +1043,7 @@ class FrameAggregateTestBase(
         # Original row order: [10, -5, 0, 20, None, 50, 30, 60, 15, 15, 40, -10]
         # Nulls in sum_rolling_1 should produce None (or NaN in Pandas).
         expected = [10, -5, 0, 20, None, 50, 30, 60, 15, 15, 40, -10]
-        _assert_values_with_nulls(result_col, expected)
+        assert_values_with_nulls(result_col, expected, nan_is_null=True, approx=True)
 
     def test_all_null_values_returns_null(self) -> None:
         """When all values in the source column are null, results should be null."""
@@ -1018,7 +1060,7 @@ class FrameAggregateTestBase(
         assert self.get_row_count(result) == 3
         result_col = self.extract_column(result, "value_int__cumsum")
         for i, val in enumerate(result_col):
-            assert _is_null(val), f"row {i}: expected null, got {val}"
+            assert is_null(val), f"row {i}: expected null, got {val}"
 
     def test_window_larger_than_partition(self) -> None:
         """Rolling window larger than partition should include all rows in the partition."""

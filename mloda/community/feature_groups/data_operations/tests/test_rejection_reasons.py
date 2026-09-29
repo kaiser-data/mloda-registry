@@ -86,12 +86,17 @@ class TestMultiElementArityRejectionReported:
         assert PyArrowFfill._strict_validation_rejection_reason("my_result", options) is None
 
     def test_guard_rejected_container_type_reports_the_guard_not_arity(self) -> None:
-        """A guard that rejects the container type itself must be named, not misreported as an arity failure."""
-        options = Options(context={"arithmetic_op": "add", "in_features": {("a",), ("b",)}})
+        """A guard that rejects the container type itself must be named, not misreported as an arity failure.
+
+        The set holds exactly two strings so the in_features count gate passes and the guard is reached.
+        """
+        options = Options(context={"arithmetic_op": "add", "in_features": {"a", "b"}})
+        assert PyArrowPointArithmetic.match_feature_group_criteria("my_result", options, None) is False
         reason = PyArrowPointArithmetic._strict_validation_rejection_reason("my_result", options)
         assert reason is not None
         assert "option 'in_features' must be" in reason
         assert "got set" in reason
+        assert "exactly one" not in reason
 
 
 class TestPresentRequiredOptionReportsNothing:
@@ -155,3 +160,15 @@ class TestReleasedLeafImportCompat:
         from mloda.community.feature_groups.data_operations.base import RejectionReasonMixin
 
         assert RejectionReasonMixin is FeatureChainParserMixin
+
+    def test_deprecated_input_columns_and_framework_shims_still_work(self) -> None:
+        """Old leaves pinned against >= this base still call these two removed hooks."""
+        from mloda.community.feature_groups.data_operations.python_dict_helpers import (
+            input_columns_and_framework,
+        )
+        from mloda.community.feature_groups.data_operations.row_preserving.arithmetic.base import (
+            ArithmeticFeatureGroupBase,
+        )
+
+        assert input_columns_and_framework({"a": [1]}) == (["a"], "PythonDict")
+        assert ArithmeticFeatureGroupBase._input_columns_and_framework({"a": [1]}) == (["a"], "dict")

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from enum import Enum
 from typing import Any, TypeVar
 
@@ -231,6 +231,52 @@ _PARAMETRIC_SUFFIX_PATTERN = re.compile(r"[1-9][0-9]*")
 def is_parametric_suffix(suffix: str) -> bool:
     """True for the ASCII positive-integer suffix of a parametric operation token (e.g. the 4 in ntile_4)."""
     return _PARAMETRIC_SUFFIX_PATTERN.fullmatch(suffix) is not None
+
+
+# ---------------------------------------------------------------------------
+# Shared source-column presence guard
+# ---------------------------------------------------------------------------
+
+
+def available_columns(data: Any) -> list[str]:
+    """Column names of ``data``, dispatched by type across supported frameworks.
+
+    Dispatch is on ``type(data)``, not the instance, since a pandas column named
+    ``column_names`` or ``collect_schema`` would otherwise hijack instance attribute lookup;
+    pyarrow uses ``column_names`` because its ``.columns`` holds arrays, not names.
+    """
+    if isinstance(data, dict):
+        return list(data.keys())
+    cls = type(data)
+    if hasattr(cls, "collect_schema"):
+        return list(data.collect_schema().names())
+    if hasattr(cls, "column_names"):
+        return list(data.column_names)
+    return list(data.columns)
+
+
+def assert_source_columns_present(data: Any, columns: Iterable[str], label: str = "Source column") -> None:
+    """Raise ``ValueError`` naming the first of ``columns`` absent from ``data`` (exact match)."""
+    names = available_columns(data)
+    for col in columns:
+        if col not in names:
+            raise ValueError(f"{label} {col!r} is not present in the {type(data).__name__} input; available: {names}.")
+
+
+def assert_key_columns_present(
+    data: Any,
+    partition_by: Iterable[str] | None = None,
+    order_by: str | None = None,
+    mask_spec: list[tuple[str, str, Any]] | None = None,
+    order_label: str = "order_by",
+) -> None:
+    """Raise ``ValueError`` for the first partition_by, order_by or mask column absent from ``data``; None skips."""
+    if partition_by:
+        assert_source_columns_present(data, partition_by, label="partition_by")
+    if order_by is not None:
+        assert_source_columns_present(data, [order_by], label=order_label)
+    if mask_spec:
+        assert_source_columns_present(data, [spec[0] for spec in mask_spec], label="mask column")
 
 
 # Deprecated alias: released leaves still import this name.

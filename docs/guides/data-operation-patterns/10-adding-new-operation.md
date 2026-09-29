@@ -36,7 +36,8 @@ File: `mloda/community/feature_groups/data_operations/{category}/{your_op}/base.
 
 ```python
 from typing import Any
-from mloda.provider import FeatureGroup, FeatureSet
+from mloda.provider import FeatureChainParserMixin, FeatureGroup, FeatureSet
+from mloda.community.feature_groups.data_operations.base import assert_source_columns_present
 
 
 YOUR_OPS = {
@@ -45,14 +46,15 @@ YOUR_OPS = {
 }
 
 
-class YourOpFeatureGroup(FeatureGroup):
+class YourOpFeatureGroup(FeatureChainParserMixin, FeatureGroup):
     PREFIX_PATTERN = r".+__(op_a|op_b)$"
 
     @classmethod
     def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
         table = data
         for feature in features.features:
-            source_col = cls._extract_source_features(feature)[0]
+            source_col = cls._extract_single_source_feature(feature)
+            assert_source_columns_present(data, [source_col])
             op = cls._extract_op(feature)
             table = cls._compute(table, feature.name, source_col, op)
         return table
@@ -67,9 +69,11 @@ The base class owns:
 - The feature-name regex.
 - The loop over `features.features`.
 - Extraction of source column, operation, and any options from `Options(context=...)`.
+- The shared `assert_source_columns_present` presence guard, called once per feature before any per-backend dtype guard.
+- The shared `assert_key_columns_present` guard for `partition_by`, `order_by` (or `time_column`) and mask columns, called once per feature before the compute hook.
 - Delegation to a per-framework `_compute` hook.
 
-Existing bases to crib from: `row_preserving/binning/base.py` (simple), `row_preserving/window_aggregation/base.py` (with `partition_by`/`order_by`/masks). They compose `FeatureChainParserMixin` to parse the suffix of the feature name; copy that detail verbatim from the closest existing base.
+Existing bases to crib from: `row_preserving/binning/base.py` (simple), `row_preserving/window_aggregation/base.py` (with `partition_by`/`order_by`/masks). They compose `FeatureChainParserMixin` to parse the suffix of the feature name; copy that detail verbatim from the closest existing base. Single-input ops use `_extract_single_source_feature` so the MIN/MAX in_features check lives in the core helper, not a per-op override. Likewise, inherit `input_features`, `_extract_source_features` (a single-input op needs no override of it), and the match-time MIN/MAX check from the mixin instead of overriding them.
 
 ---
 
@@ -219,23 +223,30 @@ class YourOpTestBase(MaskTestMixin, DataOpsTestBase):
     # mask_is_in_expected, mask_greater_than_expected, mask_no_mask_expected
 ```
 
-`MaskTestMixin` adds inherited test methods covering equal, AND-combined, `is_in`, greater-than, fully-masked, no-mask-baseline, and missing-value (null and NaN) scenarios. See [Masking](../feature-group-patterns/25-masking.md) for the full user-facing spec.
+`MaskTestMixin` adds inherited test methods covering a missing mask column, equal, AND-combined, `is_in`, greater-than, fully-masked, no-mask-baseline, and missing-value (null and NaN) scenarios. See [Masking](../feature-group-patterns/25-masking.md) for the full user-facing spec.
 
 If the new op has a documented NaN policy (see [the reference-implementation guide](03-reference-implementation.md#when-pyarrow-has-no-kernel-or-is-the-outlier)), wire it up to `NanPolicyTestMixin` (`mloda/testing/feature_groups/data_operations/mixins/nan_policy.py`) instead of writing a bespoke `test_nan_policy_*` method. Override `nan_policy_cases` (case id -> expected value, required) and `nan_policy_feature_name` (case id -> feature name, required); `nan_policy_agg_type` defaults to the case id, `nan_policy_feature_set` defaults to partitioning by `"grp"`, `nan_policy_divergent_cases` defaults to no divergences, and `nan_policy_extract_values` defaults to a plain list column. A divergent case only applies for a concrete framework test class that names its agg type (via `nan_policy_agg_type`) in that class's own `nan_divergent_agg_types()`; a framework with no divergence for the op does not need to override `nan_policy_divergent_cases` at all. The default skip hook calls `_skip_if_unsupported`, which needs a `supported_*` set on the base (e.g. `supported_agg_types`); ops without one (resample, percentile) must override `nan_policy_skip_if_unsupported` instead.
 
 A new case-parametrized test mixin inherits `CaseParametrizationTestMixin` (`mloda/testing/feature_groups/data_operations/mixins/case_parametrization.py`) and declares its fixture in `_case_fixtures`, rather than defining its own `pytest_generate_tests`; `mixins/tests/test_mixin_isolation.py` enforces this structurally.
+
+Every test base also mixes in `OutputContractTestMixin` (`mloda/testing/feature_groups/data_operations/mixins/output_contract.py`), which covers the result-type, row-count, and new-column checks that used to be hand-written per base. Override `output_contract_feature_set` (an instance method) to return the `FeatureSet` to exercise, and `output_contract_expected_row_count` when the op changes the row count (return the expected count for the test dataset).
+
+Every op test base also wires up `InputValidationTestMixin` (`mloda/testing/feature_groups/data_operations/mixins/input_validation.py`) and overrides `input_validation_cases()`, declaring each of `multi_column_in_features`, `missing_source_column`, `empty_partition_by`, `missing_partition_by_column`, and `missing_order_by_column` as an `InputValidationCase` (feature name, context, `match`, and optionally a `table` for fresh test data), a reason string (skips with that reason), or `None` (does not apply to this op). The `multi_column_in_features` case also drives the inherited `test_mixin_empty_in_features` zero-in_features check, so declare it as an `InputValidationCase` (config-based) or a reason string to skip.
 
 ---
 
 ## Checklist
 
 - [ ] Base class with `PREFIX_PATTERN`, `calculate_feature`, and an abstract `_compute` hook.
+- [ ] `calculate_feature` calls `assert_source_columns_present(data, [...])` once per feature, before any per-backend dtype guard, and `assert_key_columns_present(data, ...)` for its partition, order and mask columns.
 - [ ] PyArrow implementation first; it is the reference.
 - [ ] Test base in `mloda/testing/.../{your_op}.py` with inherited test methods.
 - [ ] One framework implementation per target framework, each respecting row-preserving if applicable.
 - [ ] One `tests/test_{framework}.py` per framework, importing the framework mixin.
 - [ ] `supported_ops()` overrides only where the framework genuinely cannot do the op.
 - [ ] Mask tests wired if the op consumes values that benefit from conditional inclusion.
+- [ ] `OutputContractTestMixin` mixed in, with `output_contract_feature_set` overridden (and `output_contract_expected_row_count` overridden when the op changes the row count).
+- [ ] `InputValidationTestMixin` wired with `input_validation_cases()` covering every kind.
 
 ---
 

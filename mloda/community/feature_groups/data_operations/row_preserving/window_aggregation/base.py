@@ -15,6 +15,8 @@ from mloda.community.feature_groups.data_operations.aggregation_base import (
 from mloda.community.feature_groups.data_operations.base import (
     COLUMN_REF_EXPECTED,
     OP_TOKEN_EXPECTED,
+    assert_key_columns_present,
+    assert_source_columns_present,
     column_ref_value,
     is_column_ref,
     is_op_token,
@@ -207,8 +209,8 @@ class WindowAggregationFeatureGroup(AggregationFeatureGroupBase):
         for feature in features.features:
             feature_name = feature.name
 
-            source_features = cls._extract_source_features(feature)
-            source_col = source_features[0]
+            source_col = cls._extract_single_source_feature(feature)
+            assert_source_columns_present(data, [source_col])
             agg_type = cls._extract_aggregation_type(feature)
             partition_by = feature.options.get(cls.PARTITION_BY)
             if not isinstance(partition_by, (list, tuple)) or not partition_by:
@@ -218,6 +220,7 @@ class WindowAggregationFeatureGroup(AggregationFeatureGroupBase):
             partition_by = list(partition_by)
             order_by = option_value(feature.options, cls.ORDER_BY, column_ref_value)
             mask_spec = parse_mask_spec(feature.options.get(MASK_KEY))
+            assert_key_columns_present(data, partition_by, order_by, mask_spec)
 
             table = cls._compute_window(table, feature_name, source_col, partition_by, agg_type, order_by, mask_spec)
 

@@ -7,17 +7,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mloda-community"
-version = "0.4.7"
+version = "0.5.0"
 description = "All community plugins for mloda"
 license = "Apache-2.0"
 authors = [{ name = "Tom Kaltofen", email = "info@mloda.ai" }]
-dependencies = ["mloda>=0.14.0,<0.15.0", "mloda-community-extenders-shared==0.4.7", "mloda-community-example==0.4.7", "mloda-community-example-a==0.4.7", "mloda-community-data-operations==0.4.7", "mloda-community-aggregation==0.4.7", "mloda-community-rank==0.4.7", "mloda-community-offset==0.4.7", "mloda-community-window-aggregation==0.4.7", "mloda-community-frame-aggregate==0.4.7", "mloda-community-scalar-aggregate==0.4.7", "mloda-community-scalar-arithmetic==0.4.7", "mloda-community-point-arithmetic==0.4.7", "mloda-community-datetime==0.4.7", "mloda-community-string==0.4.7", "mloda-community-binning==0.4.7", "mloda-community-percentile==0.4.7", "mloda-community-time-bucketization==0.4.7", "mloda-community-ffill==0.4.7", "mloda-community-ema==0.4.7", "mloda-community-sessionization==0.4.7", "mloda-community-resample==0.4.7"]
+dependencies = ["mloda>=0.14.0,<0.15.0", "mloda-community-extenders-shared==0.5.0", "mloda-community-example==0.5.0", "mloda-community-example-a==0.5.0", "mloda-community-data-operations==0.5.0", "mloda-community-aggregation==0.5.0", "mloda-community-rank==0.5.0", "mloda-community-offset==0.5.0", "mloda-community-window-aggregation==0.5.0", "mloda-community-frame-aggregate==0.5.0", "mloda-community-scalar-aggregate==0.5.0", "mloda-community-scalar-arithmetic==0.5.0", "mloda-community-point-arithmetic==0.5.0", "mloda-community-datetime==0.5.0", "mloda-community-string==0.5.0", "mloda-community-binning==0.5.0", "mloda-community-percentile==0.5.0", "mloda-community-time-bucketization==0.5.0", "mloda-community-ffill==0.5.0", "mloda-community-ema==0.5.0", "mloda-community-sessionization==0.5.0", "mloda-community-resample==0.5.0"]
 requires-python = ">=3.10,<3.15"
 
 [project.optional-dependencies]
-otel = ["mloda-community-otel==0.4.7"]
-openlineage = ["mloda-community-openlineage==0.4.7"]
-all = ["mloda-community-otel==0.4.7", "mloda-community-openlineage==0.4.7"]
+otel = ["mloda-community-otel==0.5.0"]
+openlineage = ["mloda-community-openlineage==0.5.0"]
+all = ["mloda-community-otel==0.5.0", "mloda-community-openlineage==0.5.0"]
 
 [project.urls]
 Homepage = "https://mloda.ai"

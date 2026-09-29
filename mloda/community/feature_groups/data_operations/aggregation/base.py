@@ -10,7 +10,12 @@ from mloda.community.feature_groups.data_operations.aggregation_base import (
     AGGREGATION_TYPES,
     AggregationFeatureGroupBase,
 )
-from mloda.community.feature_groups.data_operations.base import OP_TOKEN_EXPECTED, is_op_token
+from mloda.community.feature_groups.data_operations.base import (
+    OP_TOKEN_EXPECTED,
+    assert_key_columns_present,
+    assert_source_columns_present,
+    is_op_token,
+)
 from mloda.community.feature_groups.data_operations.mask_utils import MASK_KEY, parse_mask_spec
 
 
@@ -77,7 +82,7 @@ class AggregationFeatureGroup(AggregationFeatureGroupBase):
     ### Context Parameters
     - ``aggregation_type``: The type of aggregation to perform
     - ``in_features``: The source feature to aggregate
-    - ``partition_by``: List of columns to partition by
+    - ``partition_by``: List of columns to partition by; ``[]`` aggregates the whole table into one row
     """
 
     PREFIX_PATTERN = r".*__([\w]+)_agg$"
@@ -151,11 +156,12 @@ class AggregationFeatureGroup(AggregationFeatureGroupBase):
         for feature in features.features:
             feature_name = feature.name
 
-            source_features = cls._extract_source_features(feature)
-            source_col = source_features[0]
+            source_col = cls._extract_single_source_feature(feature)
+            assert_source_columns_present(data, [source_col])
             agg_type = cls._extract_aggregation_type(feature)
             partition_by = feature.options.get(cls.PARTITION_BY)
             mask_spec = parse_mask_spec(feature.options.get(MASK_KEY))
+            assert_key_columns_present(data, partition_by, mask_spec=mask_spec)
 
             table = cls._compute_group(table, feature_name, source_col, partition_by, agg_type, mask_spec)
 

@@ -16,6 +16,7 @@ from mloda.user import DataType, Feature
 
 from mloda.community.feature_groups.data_operations.base import (
     OP_TOKEN_EXPECTED,
+    assert_source_columns_present,
     is_op_token,
     op_token_value,
 )
@@ -135,8 +136,8 @@ class StringFeatureGroup(FeatureChainParserMixin, FeatureGroup):
         for feature in features.features:
             feature_name = feature.name
 
-            source_features = cls._extract_source_features(feature)
-            source_col = source_features[0]
+            source_col = cls._extract_single_source_feature(feature)
+            assert_source_columns_present(data, [source_col])
             op = cls._extract_string_op(feature)
 
             table = cls._compute_string(table, feature_name, source_col, op)

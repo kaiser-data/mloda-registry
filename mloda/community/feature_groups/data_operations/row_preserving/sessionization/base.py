@@ -41,8 +41,8 @@ is not matched.
 Every backend (pandas, polars-lazy, PyArrow, DuckDB, SQLite) computes
 sessionization NATIVELY; there is no rejection of supported inputs. PyArrow is
 the cross-framework reference oracle. Compute subclasses implement
-``_compute_session`` (the backend gap-and-cumsum) and
-``_assert_source_column_present`` (the guard).
+``_compute_session`` (the backend gap-and-cumsum); the partition_by and
+order_by presence guard is shared (``assert_key_columns_present``).
 """
 
 from __future__ import annotations
@@ -61,6 +61,7 @@ from mloda.user import Feature, FeatureName, Options
 
 from mloda.community.feature_groups.data_operations.base import (
     COLUMN_REF_EXPECTED,
+    assert_key_columns_present,
     column_ref_value,
     is_column_ref,
 )
@@ -151,10 +152,12 @@ class SessionizationFeatureGroup(FeatureChainParserMixin, FeatureGroup):
             return False
         return super().match_feature_group_criteria(feature_name, options, _data_access_collection)
 
+    # Kept: a config-only feature must raise here, not fall back to in_features as core does.
     def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
         source_feature = self._extract_source_features(Feature(str(feature_name), options=options))[0]
         return {Feature(source_feature)}
 
+    # Kept: the source comes only from the name; a config-only feature must raise, not fall back to in_features.
     @classmethod
     def _extract_source_features(cls, feature: Feature) -> list[str]:
         """Extract the single source feature from the feature name."""
@@ -206,24 +209,19 @@ class SessionizationFeatureGroup(FeatureChainParserMixin, FeatureGroup):
         for feature in features.features:
             feature_name = feature.name
 
-            source_features = cls._extract_source_features(feature)
-            source_col = source_features[0]
+            source_col = cls._extract_single_source_feature(feature)
             token = cls._extract_threshold_token(feature)
             n, unit = _parse_sessionize_op(token)
             threshold_seconds = _sessionize_threshold_seconds(n, unit)
             partition_by = cls._extract_partition_by(feature)
             order_by = cls._extract_order_by(feature, source_col)
 
-            cls._assert_source_column_present(table, order_by)
+            order_label = "Source column" if order_by == source_col else "order_by"
+            assert_key_columns_present(data, partition_by, order_by, order_label=order_label)
 
             table = cls._compute_session(table, feature_name, order_by, threshold_seconds, partition_by)
 
         return table
-
-    @classmethod
-    def _assert_source_column_present(cls, data: Any, order_col: str) -> None:
-        """Reject a missing source column with a clear ``ValueError`` (backend-specific)."""
-        raise NotImplementedError
 
     @classmethod
     def _compute_session(

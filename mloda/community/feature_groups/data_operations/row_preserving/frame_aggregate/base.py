@@ -17,7 +17,7 @@ from mloda.provider import (
     property_spec,
     record_match_rejection,
 )
-from mloda.user import DataType, Feature, FeatureName, Options
+from mloda.user import DataType, Feature, Options
 
 from mloda.community.feature_groups.data_operations.base import (
     COLUMN_REF_EXPECTED,
@@ -25,6 +25,8 @@ from mloda.community.feature_groups.data_operations.base import (
     OP_TOKEN_EXPECTED,
     POSITIVE_INT_EXPECTED,
     always_required,
+    assert_key_columns_present,
+    assert_source_columns_present,
     column_ref_value,
     is_column_ref,
     is_in_features_value,
@@ -292,25 +294,6 @@ class FrameAggregateFeatureGroup(SubtypeCapabilityHook, FeatureChainParserMixin,
         ),
     }
 
-    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
-        """Parse input features from the four frame patterns or config fallback."""
-        name = str(feature_name)
-        parsed = self._parse_frame_feature(name)
-        if parsed is not None:
-            return {Feature(parsed["source_col"])}
-        in_features_set = options.get_in_features()
-        return set(in_features_set)
-
-    @classmethod
-    def _extract_source_features(cls, feature: Feature) -> list[str]:
-        """Extract source features from the four frame patterns or config fallback."""
-        name = feature.name
-        parsed = cls._parse_frame_feature(name)
-        if parsed is not None:
-            return [parsed["source_col"]]
-        in_features_set = feature.options.get_in_features()
-        return [str(f.name) for f in in_features_set]
-
     @classmethod
     def _parse_frame_feature(cls, feature_name: str) -> dict[str, Any] | None:
         """Parse a frame aggregate feature name into its components.
@@ -482,9 +465,8 @@ class FrameAggregateFeatureGroup(SubtypeCapabilityHook, FeatureChainParserMixin,
                 "order_by": order_by,
             }
 
-        source_features = cls._extract_source_features(feature)
         return {
-            "source_col": source_features[0],
+            "source_col": cls._extract_single_source_feature(feature),
             "agg_type": op_token_value(feature.options.get(cls.AGGREGATION_TYPE)),
             "frame_type": op_token_value(feature.options.get(cls.FRAME_TYPE)),
             "frame_size": option_value(feature.options, cls.FRAME_SIZE, positive_int_value),
@@ -509,8 +491,10 @@ class FrameAggregateFeatureGroup(SubtypeCapabilityHook, FeatureChainParserMixin,
         for feature in features.features:
             feature_name = feature.name
             params = cls._extract_params(feature)
+            assert_source_columns_present(data, [params["source_col"]])
 
             mask_spec = parse_mask_spec(feature.options.get(MASK_KEY))
+            assert_key_columns_present(data, params["partition_by"], params["order_by"], mask_spec)
 
             table = cls._compute_frame(
                 table,

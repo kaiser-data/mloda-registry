@@ -12,10 +12,11 @@ from mloda.provider import (
     FeatureSet,
     property_spec,
 )
-from mloda.user import DataType, Feature, FeatureName, Options
+from mloda.user import DataType, Feature
 
 from mloda.community.feature_groups.data_operations.base import (
     OP_TOKEN_EXPECTED,
+    assert_source_columns_present,
     is_op_token,
     op_token_value,
 )
@@ -139,32 +140,6 @@ class DateTimeFeatureGroup(FeatureChainParserMixin, FeatureGroup):
         cls._extract_datetime_op(feature)
         return DataType.INT64
 
-    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
-        _feature_name = str(feature_name)
-
-        prefix_patterns = self._get_prefix_patterns()
-        operation_config, source_feature = FeatureChainParser.parse_feature_name(_feature_name, prefix_patterns)
-
-        if operation_config is not None and source_feature is not None and source_feature:
-            return {Feature(source_feature)}
-
-        in_features_set = options.get_in_features()
-        self._validate_in_feature_count(list(in_features_set), _feature_name)
-        return set(in_features_set)
-
-    @classmethod
-    def _extract_source_features(cls, feature: Feature) -> list[str]:
-        feature_name = feature.name
-        prefix_patterns = cls._get_prefix_patterns()
-
-        operation_config, source_feature = FeatureChainParser.parse_feature_name(feature_name, prefix_patterns)
-
-        if operation_config is not None and source_feature is not None and source_feature:
-            return [source_feature]
-
-        in_features_set = feature.options.get_in_features()
-        return [str(f.name) for f in in_features_set]
-
     @classmethod
     def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
         table = data
@@ -172,8 +147,8 @@ class DateTimeFeatureGroup(FeatureChainParserMixin, FeatureGroup):
         for feature in features.features:
             feature_name = feature.name
 
-            source_features = cls._extract_source_features(feature)
-            source_col = source_features[0]
+            source_col = cls._extract_single_source_feature(feature)
+            assert_source_columns_present(data, [source_col])
             op = cls._extract_datetime_op(feature)
 
             table = cls._compute_datetime(table, feature_name, source_col, op)

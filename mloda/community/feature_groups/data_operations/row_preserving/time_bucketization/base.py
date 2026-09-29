@@ -45,10 +45,11 @@ from mloda.provider import (
     FeatureSet,
     property_spec,
 )
-from mloda.user import Feature, FeatureName, Options
+from mloda.user import Feature
 
 from mloda.community.feature_groups.data_operations.base import (
     OP_TOKEN_EXPECTED,
+    assert_source_columns_present,
     is_op_token,
     op_token_value,
 )
@@ -199,52 +200,6 @@ class TimeBucketizationFeatureGroup(FeatureChainParserMixin, FeatureGroup):
             raise ValueError(f"Could not extract bucket op for {feature_name}")
         return op_token_value(op)
 
-    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
-        _feature_name = str(feature_name)
-
-        prefix_patterns = self._get_prefix_patterns()
-        operation_config, source_feature = FeatureChainParser.parse_feature_name(_feature_name, prefix_patterns)
-
-        if operation_config and source_feature:
-            return {Feature(source_feature)}
-
-        in_features_set = options.get_in_features()
-        self._validate_in_feature_count(list(in_features_set), _feature_name)
-        return set(in_features_set)
-
-    @classmethod
-    def _extract_source_features(cls, feature: Feature) -> list[str]:
-        """Extract and validate the single source feature.
-
-        Returns a one-element list containing the source column name.
-        Raises ValueError if more than one source feature is found, since
-        time bucketization only supports a single source column.
-        """
-        feature_name = feature.name
-        prefix_patterns = cls._get_prefix_patterns()
-
-        operation_config, source_feature = FeatureChainParser.parse_feature_name(feature_name, prefix_patterns)
-
-        if operation_config and source_feature:
-            return [source_feature]
-
-        in_features_set = feature.options.get_in_features()
-        source_names: list[str] = [str(f.name) for f in in_features_set]
-
-        if len(source_names) < cls.MIN_IN_FEATURES:
-            raise ValueError(
-                f"Time bucketization requires at least {cls.MIN_IN_FEATURES} source feature, "
-                f"but got {len(source_names)} (in_features is empty)."
-            )
-
-        if len(source_names) > cls.MAX_IN_FEATURES:
-            raise ValueError(
-                f"Time bucketization supports at most {cls.MAX_IN_FEATURES} source feature, "
-                f"but got {len(source_names)}: {source_names}"
-            )
-
-        return source_names
-
     @staticmethod
     def _raise_non_timestamp_source(source_col: str, got: object) -> None:
         """Shared error format for the timestamp-source contract.
@@ -276,8 +231,9 @@ class TimeBucketizationFeatureGroup(FeatureChainParserMixin, FeatureGroup):
         2. Extract the op token (string-pattern or Options).
         3. Parse the op token via ``_parse_bucket_op`` (raises ValueError on
            invalid tokens such as ``n=0`` or ``floor_2_week``).
-        4. Assert the source column is a timestamp/datetime type.
-        5. Dispatch to ``_compute_bucket`` for the backend-specific math.
+        4. Assert the source column is present.
+        5. Assert the source column is a timestamp/datetime type.
+        6. Dispatch to ``_compute_bucket`` for the backend-specific math.
 
         Null timestamps propagate to null output. The output column has the
         same timestamp type (resolution, tz) as the input.
@@ -287,8 +243,8 @@ class TimeBucketizationFeatureGroup(FeatureChainParserMixin, FeatureGroup):
         for feature in features.features:
             feature_name = feature.name
 
-            source_features = cls._extract_source_features(feature)
-            source_col = source_features[0]
+            source_col = cls._extract_single_source_feature(feature)
+            assert_source_columns_present(data, [source_col])
             op_token = cls._extract_bucket_op(feature)
 
             op, n, unit = _parse_bucket_op(op_token)

@@ -24,11 +24,18 @@ from itertools import combinations
 from types import ModuleType
 from typing import Any, ClassVar, Iterator, cast
 
+import pyarrow as pa
 import pytest
 
 import mloda.community.feature_groups.data_operations as data_operations_pkg
 import mloda.testing.feature_groups.data_operations.mixins as mixins_pkg
+from mloda.testing.feature_groups.data_operations.base import DataOpsTestBase
 from mloda.testing.feature_groups.data_operations.mixins.case_parametrization import CaseParametrizationTestMixin
+from mloda.testing.feature_groups.data_operations.mixins.input_validation import (
+    InputValidationCase,
+    InputValidationTestMixin,
+)
+from mloda.testing.feature_groups.data_operations.mixins.output_contract import OutputContractTestMixin
 
 # Dunders that every class carries purely from being a class; they are not
 # "methods the author added" and must be excluded from collision detection.
@@ -311,3 +318,166 @@ class TestMixinIsolation:
         SubExtending().pytest_generate_tests(cast(pytest.Metafunc, stub_extending))
         assert stub_extending.recorded["override_case"] == ["a"]
         assert stub_extending.recorded["extra_case"] == ["e"]
+
+    def test_every_data_ops_test_class_mixes_in_output_contract(self) -> None:
+        """Every concrete ``DataOpsTestBase`` subclass must also mix in ``OutputContractTestMixin``."""
+        offenders: list[str] = []
+        concrete_classes = [cls for cls in _iter_concrete_test_classes() if issubclass(cls, DataOpsTestBase)]
+        assert concrete_classes, "no concrete DataOpsTestBase subclasses discovered; discovery is broken"
+
+        for cls in concrete_classes:
+            if not issubclass(cls, OutputContractTestMixin):
+                offenders.append(f"{cls.__module__}.{cls.__name__}")
+        assert not offenders, "DataOpsTestBase subclasses missing OutputContractTestMixin:\n" + "\n".join(
+            sorted(offenders)
+        )
+
+    def test_input_validation_missing_or_unknown_kind_raises(self) -> None:
+        """A subclass whose input_validation_cases() misses or adds a kind fails at collection time."""
+
+        class MissingKind(InputValidationTestMixin):
+            @classmethod
+            def input_validation_cases(cls) -> dict[str, Any]:
+                return {
+                    "multi_column_in_features": "n/a",
+                    "missing_source_column": "n/a",
+                    "empty_partition_by": "n/a",
+                    "missing_partition_by_column": "n/a",
+                }
+
+        stub = _StubMetafunc(["input_validation_case"])
+        with pytest.raises(TypeError, match="must declare exactly"):
+            MissingKind().pytest_generate_tests(cast(pytest.Metafunc, stub))
+
+        class UnknownKind(InputValidationTestMixin):
+            @classmethod
+            def input_validation_cases(cls) -> dict[str, Any]:
+                return {
+                    "multi_column_in_features": "n/a",
+                    "missing_source_column": "n/a",
+                    "empty_partition_by": "n/a",
+                    "missing_partition_by_column": "n/a",
+                    "missing_order_by_column": "n/a",
+                    "bogus_kind": "n/a",
+                }
+
+        stub2 = _StubMetafunc(["input_validation_case"])
+        with pytest.raises(TypeError, match="must declare exactly"):
+            UnknownKind().pytest_generate_tests(cast(pytest.Metafunc, stub2))
+
+    def test_input_validation_none_not_parametrized_and_str_skips(self) -> None:
+        """None omits a kind; str and InputValidationCase values are parametrized; a str value skips."""
+
+        class Declared(InputValidationTestMixin):
+            @classmethod
+            def input_validation_cases(cls) -> dict[str, Any]:
+                return {
+                    "multi_column_in_features": InputValidationCase("f", {}, "boom"),
+                    "missing_source_column": "known gap",
+                    "empty_partition_by": None,
+                    "missing_partition_by_column": None,
+                    "missing_order_by_column": None,
+                }
+
+        stub = _StubMetafunc(["input_validation_case"])
+        Declared().pytest_generate_tests(cast(pytest.Metafunc, stub))
+        assert set(stub.recorded["input_validation_case"]) == {"multi_column_in_features", "missing_source_column"}
+
+        instance = Declared()
+        with pytest.raises(pytest.skip.Exception):
+            instance.test_mixin_input_validation("missing_source_column")
+
+    def test_input_validation_case_ids_rejects_bad_value_types(self) -> None:
+        """A value that is not InputValidationCase, str, or None must raise TypeError."""
+
+        class BadValueType(InputValidationTestMixin):
+            @classmethod
+            def input_validation_cases(cls) -> dict[str, Any]:
+                return {
+                    "multi_column_in_features": 1,
+                    "missing_source_column": "known gap",
+                    "empty_partition_by": None,
+                    "missing_partition_by_column": None,
+                    "missing_order_by_column": None,
+                }
+
+        with pytest.raises(TypeError, match="InputValidationCase"):
+            BadValueType.input_validation_case_ids()
+
+        class EmptyReason(InputValidationTestMixin):
+            @classmethod
+            def input_validation_cases(cls) -> dict[str, Any]:
+                return {
+                    "multi_column_in_features": "",
+                    "missing_source_column": "known gap",
+                    "empty_partition_by": None,
+                    "missing_partition_by_column": None,
+                    "missing_order_by_column": None,
+                }
+
+        with pytest.raises(TypeError, match="InputValidationCase"):
+            EmptyReason.input_validation_case_ids()
+
+    def test_input_validation_empty_in_features_derived_from_multi_column_case(self) -> None:
+        """test_mixin_empty_in_features derives a zero-in_features check from the multi_column case."""
+
+        class _FakeImplementation:
+            @staticmethod
+            def calculate_feature(data: Any, fs: Any) -> Any:
+                feature = next(iter(fs.features))
+                in_features_ctx = feature.options.get("in_features")
+                try:
+                    resolved = feature.options.get_in_features()
+                except ValueError:
+                    resolved = None
+                if in_features_ctx == [] and resolved == frozenset():
+                    raise ValueError("Feature 'f' requires at least 1 in_feature(s), but found 0")
+                return data
+
+        def make_host(case: Any, impl: type = _FakeImplementation) -> type:
+            class Host(InputValidationTestMixin):
+                test_data: ClassVar[Any] = pa.table({"a": [1]})
+
+                @staticmethod
+                def create_test_data(table: Any) -> Any:
+                    return table
+
+                @staticmethod
+                def implementation_class() -> type:
+                    return impl
+
+                @classmethod
+                def input_validation_cases(cls) -> dict[str, Any]:
+                    return {
+                        "multi_column_in_features": case,
+                        "missing_source_column": "n/a",
+                        "empty_partition_by": None,
+                    }
+
+            return Host
+
+        # 1. A real case with two in_features passes only because the mixin empties both the
+        # context and get_in_features.
+        real_case = InputValidationCase("f", {"in_features": ["a", "b"]}, "requires at least")
+        Host = make_host(real_case)
+        Host().test_mixin_empty_in_features()
+
+        # 2. None skips.
+        HostNone = make_host(None)
+        with pytest.raises(pytest.skip.Exception):
+            HostNone().test_mixin_empty_in_features()
+
+        # 3. A reason string skips with that reason.
+        HostReason = make_host("n/a for this op")
+        with pytest.raises(pytest.skip.Exception, match="n/a for this op"):
+            HostReason().test_mixin_empty_in_features()
+
+        # 4. An implementation that never raises must fail the test with pytest.fail.
+        class _NeverRaisingImplementation:
+            @staticmethod
+            def calculate_feature(data: Any, fs: Any) -> Any:
+                return data
+
+        HostNeverRaises = make_host(real_case, impl=_NeverRaisingImplementation)
+        with pytest.raises(pytest.fail.Exception):
+            HostNeverRaises().test_mixin_empty_in_features()

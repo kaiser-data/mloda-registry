@@ -18,6 +18,8 @@ from mloda.community.feature_groups.data_operations.base import (
     COLUMN_REF_EXPECTED,
     IN_FEATURES_EXPECTED,
     OP_TOKEN_EXPECTED,
+    assert_key_columns_present,
+    assert_source_columns_present,
     column_ref_value,
     is_column_ref,
     is_in_features_value,
@@ -177,7 +179,7 @@ class OffsetFeatureGroup(FeatureChainParserMixin, FeatureGroup):
         options: Any,
         _data_access_collection: Any = None,
     ) -> bool:
-        """Extend mixin matching with partition_by, order_by, and in_features validation."""
+        """Extend mixin matching with partition_by and order_by validation."""
         if not super().match_feature_group_criteria(feature_name, options, _data_access_collection):
             return False
 
@@ -191,12 +193,6 @@ class OffsetFeatureGroup(FeatureChainParserMixin, FeatureGroup):
 
         if not is_column_ref(options.get(cls.ORDER_BY)):
             return False
-
-        in_features_raw = options.get(DefaultOptionKeys.in_features)
-        if in_features_raw is not None:
-            in_features = options.get_in_features()
-            if len(in_features) > cls.MAX_IN_FEATURES:
-                return False
 
         return True
 
@@ -238,8 +234,8 @@ class OffsetFeatureGroup(FeatureChainParserMixin, FeatureGroup):
         for feature in features.features:
             feature_name = feature.name
 
-            source_features = cls._extract_source_features(feature)
-            source_col = source_features[0]
+            source_col = cls._extract_single_source_feature(feature)
+            assert_source_columns_present(data, [source_col])
             offset_type = cls._extract_offset_type(feature)
             partition_by = feature.options.get(cls.PARTITION_BY)
             if not isinstance(partition_by, (list, tuple)) or not partition_by:
@@ -249,6 +245,7 @@ class OffsetFeatureGroup(FeatureChainParserMixin, FeatureGroup):
             partition_by = list(partition_by)
             # Any: matching requires order_by, but a direct call still passes an absent one through.
             order_by: Any = option_value(feature.options, cls.ORDER_BY, column_ref_value)
+            assert_key_columns_present(data, partition_by, order_by)
 
             table = cls._compute_offset(table, feature_name, source_col, partition_by, order_by, offset_type)
 

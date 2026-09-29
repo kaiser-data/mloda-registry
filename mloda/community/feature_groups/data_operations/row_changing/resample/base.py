@@ -31,7 +31,8 @@ Output columns are the ``partition_by`` columns, the bucketed ``time_column``
 ``{src}__resample_{n}_{unit}_{agg}``. Output row order is not guaranteed.
 
 PyArrow is the cross-framework reference. Subclasses implement ``_compute_resample``
-(the backend floor + group + aggregate) and the two presence guards.
+(the backend floor + group + aggregate); presence guards are shared via
+``assert_source_columns_present``.
 """
 
 from __future__ import annotations
@@ -46,11 +47,13 @@ from mloda.provider import (
     FeatureSet,
     property_spec,
 )
-from mloda.user import DataType, Feature, FeatureName, Options
+from mloda.user import DataType, Feature
 
 from mloda.community.feature_groups.data_operations.base import (
     COLUMN_REF_EXPECTED,
     always_required,
+    assert_key_columns_present,
+    assert_source_columns_present,
     column_ref_value,
     is_column_ref,
     is_op_token,
@@ -123,7 +126,7 @@ class ResampleFeatureGroup(FeatureChainParserMixin, FeatureGroup):
     """Base class for resample operations that CHANGE the row count.
 
     Subclasses must implement ``_compute_resample`` (the backend-specific
-    floor + group-by + aggregate) and the two presence guards.
+    floor + group-by + aggregate); presence guards are shared.
     """
 
     MIN_IN_FEATURES = 1
@@ -171,43 +174,7 @@ class ResampleFeatureGroup(FeatureChainParserMixin, FeatureGroup):
             return False
         return True
 
-    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
-        _feature_name = str(feature_name)
-        prefix_patterns = self._get_prefix_patterns()
-        operation_config, source_feature = FeatureChainParser.parse_feature_name(_feature_name, prefix_patterns)
-        if operation_config and source_feature:
-            return {Feature(source_feature)}
-
-        in_features_set = options.get_in_features()
-        self._validate_in_feature_count(list(in_features_set), _feature_name)
-        return set(in_features_set)
-
     # -- Name / token parsing ----------------------------------------------
-
-    @classmethod
-    def _extract_source_features(cls, feature: Feature) -> list[str]:
-        """Extract the single source feature, from the name if possible, else from ``in_features``."""
-        prefix_patterns = cls._get_prefix_patterns()
-        operation_config, source_feature = FeatureChainParser.parse_feature_name(feature.name, prefix_patterns)
-        if operation_config and source_feature:
-            return [source_feature]
-
-        in_features_set = feature.options.get_in_features()
-        source_names: list[str] = [str(f.name) for f in in_features_set]
-
-        if len(source_names) < cls.MIN_IN_FEATURES:
-            raise ValueError(
-                f"resample requires at least {cls.MIN_IN_FEATURES} source feature, "
-                f"but got {len(source_names)} (in_features is empty)."
-            )
-
-        if len(source_names) > cls.MAX_IN_FEATURES:
-            raise ValueError(
-                f"resample supports at most {cls.MAX_IN_FEATURES} source feature, but got {len(source_names)}: "
-                f"{source_names}"
-            )
-
-        return source_names
 
     @classmethod
     def _extract_resample_op(cls, feature: Feature) -> str:
@@ -254,29 +221,18 @@ class ResampleFeatureGroup(FeatureChainParserMixin, FeatureGroup):
         for feature in features.features:
             feature_name = feature.name
 
-            source_features = cls._extract_source_features(feature)
-            source_col = source_features[0]
+            source_col = cls._extract_single_source_feature(feature)
             op_token = cls._extract_resample_op(feature)
             n, unit, agg = _parse_resample_op(op_token)
             partition_by = cls._extract_partition_by(feature)
             time_column = cls._extract_time_column(feature)
 
-            cls._assert_time_column_present(table, time_column)
-            cls._assert_source_column_present(table, source_col)
+            assert_key_columns_present(data, partition_by, time_column, order_label="time_column")
+            assert_source_columns_present(data, [source_col])
 
             table = cls._compute_resample(table, feature_name, source_col, time_column, partition_by, n, unit, agg)
 
         return table
-
-    @classmethod
-    def _assert_time_column_present(cls, data: Any, time_column: str) -> None:
-        """Reject a missing time column with a clear ``ValueError`` (backend-specific)."""
-        raise NotImplementedError
-
-    @classmethod
-    def _assert_source_column_present(cls, data: Any, source_col: str) -> None:
-        """Reject a missing source column with a clear ``ValueError`` (backend-specific)."""
-        raise NotImplementedError
 
     @classmethod
     def _compute_resample(

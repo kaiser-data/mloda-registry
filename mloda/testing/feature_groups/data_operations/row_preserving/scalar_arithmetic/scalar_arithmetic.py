@@ -18,8 +18,14 @@ import pytest
 from mloda.provider import FeatureSet
 from mloda.user import Feature, Options
 
+from mloda.testing.data_creator.pyarrow import PyArrowDataOpsTestDataCreator
 from mloda.testing.feature_groups.data_operations.base import DataOpsTestBase
 from mloda.testing.feature_groups.data_operations.helpers import make_feature_set
+from mloda.testing.feature_groups.data_operations.mixins.input_validation import (
+    InputValidationCase,
+    InputValidationTestMixin,
+)
+from mloda.testing.feature_groups.data_operations.mixins.output_contract import OutputContractTestMixin
 
 # ---------------------------------------------------------------------------
 # Source column and expected values (module-level constants)
@@ -44,10 +50,36 @@ EXPECTED_DIVIDE_2: list[Any] = _apply(VALUE_INT, lambda v: v / 2.0)
 # ---------------------------------------------------------------------------
 
 
-class ScalarArithmeticTestBase(DataOpsTestBase):
+class ScalarArithmeticTestBase(InputValidationTestMixin, OutputContractTestMixin, DataOpsTestBase):
     """Abstract base class for scalar arithmetic framework tests."""
 
+    # -- OutputContractTestMixin configuration ----------------------------------
+
+    def output_contract_feature_set(self) -> FeatureSet:
+        return make_feature_set("value_int__add_constant", constant=5)
+
     ALL_OPS = {"add", "subtract", "multiply", "divide"}
+
+    # -- InputValidationTestMixin configuration ---------------------------------
+
+    @classmethod
+    def input_validation_cases(cls) -> dict[str, Any]:
+        return {
+            "multi_column_in_features": InputValidationCase(
+                "bad_multi",
+                {"arithmetic_op": "add", "in_features": ["value_int", "value_float"], "constant": 5},
+                "at most 1",
+            ),
+            "missing_source_column": InputValidationCase(
+                "value_int__add_constant",
+                {"constant": 5},
+                "Source column 'value_int' is not present",
+                table=PyArrowDataOpsTestDataCreator.create().drop_columns(["value_int"]),
+            ),
+            "empty_partition_by": None,
+            "missing_partition_by_column": None,
+            "missing_order_by_column": None,
+        }
 
     @classmethod
     def supported_ops(cls) -> set[str]:
@@ -114,25 +146,6 @@ class ScalarArithmeticTestBase(DataOpsTestBase):
                 assert actual is None
             else:
                 assert actual == pytest.approx(expected, rel=1e-6)
-
-    def test_output_rows_equal_input_rows(self) -> None:
-        fs = make_feature_set("value_int__add_constant", constant=5)
-        result = self.implementation_class().calculate_feature(self.test_data, fs)
-
-        assert self.get_row_count(result) == 12
-
-    def test_result_has_correct_type(self) -> None:
-        fs = make_feature_set("value_int__multiply_constant", constant=2)
-        result = self.implementation_class().calculate_feature(self.test_data, fs)
-
-        assert isinstance(result, self.get_expected_type())
-
-    def test_new_column_added(self) -> None:
-        fs = make_feature_set("value_int__add_constant", constant=5)
-        result = self.implementation_class().calculate_feature(self.test_data, fs)
-
-        result_col = self.extract_column(result, "value_int__add_constant")
-        assert len(result_col) == 12
 
     def test_null_values_preserved(self) -> None:
         """A null in the source must remain null in the result, regardless of op."""
@@ -214,26 +227,6 @@ class ScalarArithmeticTestBase(DataOpsTestBase):
                 assert actual is None
             else:
                 assert actual == pytest.approx(expected, rel=1e-6)
-
-    def test_multi_column_in_features_rejected_at_calculate(self) -> None:
-        """calculate_feature must reject features with multiple in_features.
-
-        Scalar arithmetic supports exactly one source column.
-        """
-        feature = Feature(
-            "bad_multi",
-            options=Options(
-                context={
-                    "arithmetic_op": "add",
-                    "in_features": ["value_int", "value_float"],
-                    "constant": 5,
-                }
-            ),
-        )
-        fs = FeatureSet()
-        fs.add(feature)
-        with pytest.raises(ValueError, match="at most 1"):
-            self.implementation_class().calculate_feature(self.test_data, fs)
 
     # ---- Source-column dtype contract (shared across backends) ----
 

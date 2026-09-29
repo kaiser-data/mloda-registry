@@ -18,6 +18,7 @@ from mloda.community.feature_groups.data_operations.base import (
     COLUMN_REF_EXPECTED,
     IN_FEATURES_EXPECTED,
     OP_TOKEN_EXPECTED,
+    assert_key_columns_present,
     column_ref_value,
     is_column_ref,
     is_in_features_value,
@@ -125,7 +126,7 @@ class RankFeatureGroup(SubtypeCapabilityHook, FeatureChainParserMixin, FeatureGr
 
     ### Context Parameters
     - ``rank_type``: The type of ranking to perform
-    - ``in_features``: The source feature (used for ordering)
+    - ``in_features``: The source feature (names the result; ordering comes from ``order_by``)
     - ``partition_by``: List of columns to partition by
     - ``order_by``: Column to order by within each partition
     """
@@ -157,7 +158,7 @@ class RankFeatureGroup(SubtypeCapabilityHook, FeatureChainParserMixin, FeatureGr
             expected=OP_TOKEN_EXPECTED,
         ),
         DefaultOptionKeys.in_features: property_spec(
-            "Source feature for rank ordering",
+            "Source feature (ordering comes from order_by)",
             strict=False,
             match_guard=is_in_features_value,
             expected=IN_FEATURES_EXPECTED,
@@ -192,7 +193,7 @@ class RankFeatureGroup(SubtypeCapabilityHook, FeatureChainParserMixin, FeatureGr
         options: Any,
         _data_access_collection: Any = None,
     ) -> bool:
-        """Extend mixin matching with partition_by, order_by, and in_features validation."""
+        """Extend mixin matching with partition_by and order_by validation."""
         if not super().match_feature_group_criteria(feature_name, options, _data_access_collection):
             return False
 
@@ -208,12 +209,6 @@ class RankFeatureGroup(SubtypeCapabilityHook, FeatureChainParserMixin, FeatureGr
 
         if not is_column_ref(options.get(cls.ORDER_BY)):
             return False
-
-        in_features_raw = options.get(DefaultOptionKeys.in_features)
-        if in_features_raw is not None:
-            in_features = options.get_in_features()
-            if len(in_features) > cls.MAX_IN_FEATURES:
-                return False
 
         return True
 
@@ -290,6 +285,8 @@ class RankFeatureGroup(SubtypeCapabilityHook, FeatureChainParserMixin, FeatureGr
         for feature in features.features:
             feature_name = feature.name
 
+            # rank never reads its source column; this call only enforces the in_features count.
+            cls._extract_single_source_feature(feature)
             rank_type = cls._extract_rank_type(feature)
             partition_by = feature.options.get(cls.PARTITION_BY)
             if not isinstance(partition_by, (list, tuple)) or not partition_by:
@@ -299,6 +296,7 @@ class RankFeatureGroup(SubtypeCapabilityHook, FeatureChainParserMixin, FeatureGr
             partition_by = list(partition_by)
             # Any: matching requires order_by, but a direct call still passes an absent one through.
             order_by: Any = option_value(feature.options, cls.ORDER_BY, column_ref_value)
+            assert_key_columns_present(data, partition_by, order_by)
 
             table = cls._compute_rank(table, feature_name, partition_by, order_by, rank_type)
 

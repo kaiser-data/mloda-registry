@@ -15,10 +15,16 @@ import pytest
 from mloda.provider import FeatureSet
 from mloda.user import Feature, Options
 
+from mloda.testing.data_creator.pyarrow import PyArrowDataOpsTestDataCreator
 from mloda.testing.feature_groups.data_operations.base import DataOpsTestBase
 from mloda.testing.feature_groups.data_operations.helpers import make_feature_set
+from mloda.testing.feature_groups.data_operations.mixins.input_validation import (
+    InputValidationCase,
+    InputValidationTestMixin,
+)
 from mloda.testing.feature_groups.data_operations.mixins.mask import MaskTestMixin
 from mloda.testing.feature_groups.data_operations.mixins.nan_policy import NanPolicyTestMixin
+from mloda.testing.feature_groups.data_operations.mixins.output_contract import OutputContractTestMixin
 
 # ---------------------------------------------------------------------------
 # Expected values (module-level constants)
@@ -59,8 +65,45 @@ NAN_POLICY_P50: list[float] = [1.5, 1.5, 1.5, 2.0, 2.0, 2.0, 2.0]
 # ---------------------------------------------------------------------------
 
 
-class PercentileTestBase(NanPolicyTestMixin, MaskTestMixin, DataOpsTestBase):
+class PercentileTestBase(
+    InputValidationTestMixin, OutputContractTestMixin, NanPolicyTestMixin, MaskTestMixin, DataOpsTestBase
+):
     """Abstract base class for percentile framework tests."""
+
+    # -- OutputContractTestMixin configuration ----------------------------------
+
+    def output_contract_feature_set(self) -> FeatureSet:
+        return make_feature_set("value_int__p50_percentile", ["region"])
+
+    # -- InputValidationTestMixin configuration ---------------------------------
+
+    @classmethod
+    def input_validation_cases(cls) -> dict[str, Any]:
+        return {
+            "multi_column_in_features": InputValidationCase(
+                "bad_multi",
+                {"percentile": 0.5, "in_features": ["value_int", "value_float"], "partition_by": ["region"]},
+                "at most 1",
+            ),
+            "missing_source_column": InputValidationCase(
+                "value_int__p50_percentile",
+                {"partition_by": ["region"]},
+                "Source column 'value_int' is not present",
+                table=PyArrowDataOpsTestDataCreator.create().drop_columns(["value_int"]),
+            ),
+            "empty_partition_by": InputValidationCase(
+                "my_result",
+                {"percentile": 0.5, "in_features": "value_int", "partition_by": []},
+                "non-empty partition_by",
+            ),
+            "missing_partition_by_column": InputValidationCase(
+                "value_int__p50_percentile",
+                {"partition_by": ["no_such_col"]},
+                "partition_by 'no_such_col' is not present",
+            ),
+            # percentile has no order column.
+            "missing_order_by_column": None,
+        }
 
     # -- MaskTestMixin configuration -------------------------------------------
 
@@ -187,28 +230,6 @@ class PercentileTestBase(NanPolicyTestMixin, MaskTestMixin, DataOpsTestBase):
         result_col = self.extract_column(result, "value_int__p50_percentile")
         assert result_col[11] == pytest.approx(-10.0, rel=1e-6)
 
-    def test_output_rows_equal_input_rows(self) -> None:
-        """Output must have exactly 12 rows, same as input."""
-        fs = make_feature_set("value_int__p50_percentile", ["region"])
-        result = self.implementation_class().calculate_feature(self.test_data, fs)
-
-        assert self.get_row_count(result) == 12
-
-    def test_new_column_added(self) -> None:
-        """The percentile result column should be added to the output."""
-        fs = make_feature_set("value_int__p50_percentile", ["region"])
-        result = self.implementation_class().calculate_feature(self.test_data, fs)
-
-        result_col = self.extract_column(result, "value_int__p50_percentile")
-        assert len(result_col) == 12
-
-    def test_result_has_correct_type(self) -> None:
-        """The result of calculate_feature must be the expected framework type."""
-        fs = make_feature_set("value_int__p50_percentile", ["region"])
-        result = self.implementation_class().calculate_feature(self.test_data, fs)
-
-        assert isinstance(result, self.get_expected_type())
-
     def test_null_policy_skip_all_null_column(self) -> None:
         """NullPolicy.SKIP: score column is all null. Percentile should produce all nulls."""
         fs = make_feature_set("score__p50_percentile", ["region"])
@@ -269,42 +290,6 @@ class PercentileTestBase(NanPolicyTestMixin, MaskTestMixin, DataOpsTestBase):
         # A/Y: [2.5, 0.0] -> sorted = [0.0, 2.5] -> p50 = 1.25
         assert result_col[1] == pytest.approx(1.25, rel=1e-6)
         assert result_col[3] == pytest.approx(1.25, rel=1e-6)
-
-    # -- Multi-column in_features rejection ------------------------------------
-
-    def test_multi_column_in_features_rejected_at_calculate(self) -> None:
-        """calculate_feature must reject features with multiple in_features."""
-        feature = Feature(
-            "bad_multi",
-            options=Options(
-                context={
-                    "percentile": 0.5,
-                    "in_features": ["value_int", "value_float"],
-                    "partition_by": ["region"],
-                }
-            ),
-        )
-        fs = FeatureSet()
-        fs.add(feature)
-        with pytest.raises(ValueError, match="at most 1"):
-            self.implementation_class().calculate_feature(self.test_data, fs)
-
-    def test_partition_by_empty_raises(self) -> None:
-        """calculate_feature must reject an empty partition_by with a clear ValueError naming it."""
-        feature = Feature(
-            "my_result",
-            options=Options(
-                context={
-                    "percentile": 0.5,
-                    "in_features": "value_int",
-                    "partition_by": [],
-                }
-            ),
-        )
-        fs = FeatureSet()
-        fs.add(feature)
-        with pytest.raises(ValueError, match="non-empty partition_by"):
-            self.implementation_class().calculate_feature(self.test_data, fs)
 
     # -- Null consistency tests (multi-null columns) ---------------------------
 

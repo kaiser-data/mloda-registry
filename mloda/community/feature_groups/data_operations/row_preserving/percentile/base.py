@@ -15,10 +15,12 @@ from mloda.provider import (
     FeatureSet,
     property_spec,
 )
-from mloda.user import Feature, FeatureName, Options
+from mloda.user import Feature
 
 from mloda.community.feature_groups.data_operations.base import (
     SCALAR_NUMBER_EXPECTED,
+    assert_key_columns_present,
+    assert_source_columns_present,
     is_scalar_number,
     scalar_number_value,
 )
@@ -242,47 +244,6 @@ class PercentileFeatureGroup(FeatureChainParserMixin, FeatureGroup):
             raise ValueError(f"Could not extract percentile for {feature_name}")
         return percentile
 
-    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
-        """Parse input features from feature name or options."""
-        _feature_name = str(feature_name)
-
-        prefix_patterns = self._get_prefix_patterns()
-        operation_config, source_feature = FeatureChainParser.parse_feature_name(_feature_name, prefix_patterns)
-
-        if operation_config is not None and source_feature is not None and source_feature:
-            return {Feature(source_feature)}
-
-        in_features_set = options.get_in_features()
-        self._validate_in_feature_count(list(in_features_set), _feature_name)
-        return set(in_features_set)
-
-    @classmethod
-    def _extract_source_features(cls, feature: Feature) -> list[str]:
-        """Extract and validate the single source feature for percentile.
-
-        Returns a one-element list containing the source column name.
-        Raises ValueError if more than one source feature is found, since
-        this package only supports single-column percentile computation.
-        """
-        feature_name = feature.name
-        prefix_patterns = cls._get_prefix_patterns()
-
-        operation_config, source_feature = FeatureChainParser.parse_feature_name(feature_name, prefix_patterns)
-
-        if operation_config is not None and source_feature is not None and source_feature:
-            return [source_feature]
-
-        in_features_set = feature.options.get_in_features()
-        source_names: list[str] = [str(f.name) for f in in_features_set]
-
-        if len(source_names) > cls.MAX_IN_FEATURES:
-            raise ValueError(
-                f"Percentile supports at most {cls.MAX_IN_FEATURES} source feature, "
-                f"but got {len(source_names)}: {source_names}"
-            )
-
-        return source_names
-
     @classmethod
     def calculate_feature(cls, data: Any, features: FeatureSet) -> Any:
         """Compute a percentile per source column, partitioned, and broadcast to all rows.
@@ -295,8 +256,8 @@ class PercentileFeatureGroup(FeatureChainParserMixin, FeatureGroup):
         for feature in features.features:
             feature_name = feature.name
 
-            source_features = cls._extract_source_features(feature)
-            source_col = source_features[0]
+            source_col = cls._extract_single_source_feature(feature)
+            assert_source_columns_present(data, [source_col])
             percentile = cls._extract_percentile(feature)
             partition_by = feature.options.get(cls.PARTITION_BY)
             if not isinstance(partition_by, (list, tuple)) or not partition_by:
@@ -305,6 +266,7 @@ class PercentileFeatureGroup(FeatureChainParserMixin, FeatureGroup):
                 )
             partition_by = list(partition_by)
             mask_spec = parse_mask_spec(feature.options.get(MASK_KEY))
+            assert_key_columns_present(data, partition_by, mask_spec=mask_spec)
 
             table = cls._compute_percentile(table, feature_name, source_col, partition_by, percentile, mask_spec)
 

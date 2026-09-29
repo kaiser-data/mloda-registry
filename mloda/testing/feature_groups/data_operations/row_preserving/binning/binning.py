@@ -16,9 +16,16 @@ from typing import Any
 
 import pyarrow as pa
 import pytest
+from mloda.provider import FeatureSet
 
+from mloda.testing.data_creator.pyarrow import PyArrowDataOpsTestDataCreator
 from mloda.testing.feature_groups.data_operations.base import DataOpsTestBase
 from mloda.testing.feature_groups.data_operations.helpers import make_feature_set
+from mloda.testing.feature_groups.data_operations.mixins.input_validation import (
+    InputValidationCase,
+    InputValidationTestMixin,
+)
+from mloda.testing.feature_groups.data_operations.mixins.output_contract import OutputContractTestMixin
 
 # ---------------------------------------------------------------------------
 # Expected values (module-level constants)
@@ -67,12 +74,38 @@ EXPECTED_QBIN_5: list[Any] = [1, 0, 0, 2, None, 4, 3, 4, 1, 2, 3, 0]
 # ---------------------------------------------------------------------------
 
 
-class BinningTestBase(DataOpsTestBase):
+class BinningTestBase(InputValidationTestMixin, OutputContractTestMixin, DataOpsTestBase):
     """Abstract base class for binning framework tests."""
+
+    # -- OutputContractTestMixin configuration ----------------------------------
+
+    def output_contract_feature_set(self) -> FeatureSet:
+        return make_feature_set("value_int__bin_3")
 
     @classmethod
     def supported_ops(cls) -> set[str]:
         return {"bin", "qbin"}
+
+    # -- InputValidationTestMixin configuration ---------------------------------
+
+    @classmethod
+    def input_validation_cases(cls) -> dict[str, Any]:
+        return {
+            "multi_column_in_features": InputValidationCase(
+                "bad_multi",
+                {"binning_op": "bin", "n_bins": 3, "in_features": ["value_int", "value_float"]},
+                "at most 1",
+            ),
+            "missing_source_column": InputValidationCase(
+                "value_int__bin_3",
+                {},
+                "Source column 'value_int' is not present",
+                table=PyArrowDataOpsTestDataCreator.create().drop_columns(["value_int"]),
+            ),
+            "empty_partition_by": None,
+            "missing_partition_by_column": None,
+            "missing_order_by_column": None,
+        }
 
     @classmethod
     def reference_implementation_class(cls) -> Any:
@@ -103,28 +136,6 @@ class BinningTestBase(DataOpsTestBase):
         result_col = self.extract_column(result, "value_int__bin_3")
         # Row 4 has value_int=None
         assert result_col[4] is None
-
-    def test_output_rows_equal_input_rows(self) -> None:
-        """Row-preserving contract: output rows == input rows."""
-        fs = make_feature_set("value_int__bin_3")
-        result = self.implementation_class().calculate_feature(self.test_data, fs)
-
-        assert self.get_row_count(result) == 12
-
-    def test_result_has_correct_type(self) -> None:
-        """The result must be the expected framework type."""
-        fs = make_feature_set("value_int__bin_3")
-        result = self.implementation_class().calculate_feature(self.test_data, fs)
-
-        assert isinstance(result, self.get_expected_type())
-
-    def test_new_column_added(self) -> None:
-        """The binning result column should be added to the output."""
-        fs = make_feature_set("value_int__bin_3")
-        result = self.implementation_class().calculate_feature(self.test_data, fs)
-
-        result_col = self.extract_column(result, "value_int__bin_3")
-        assert len(result_col) == 12
 
     def test_bin_values_in_range(self) -> None:
         """All non-null bin values must be in [0, n_bins-1]."""

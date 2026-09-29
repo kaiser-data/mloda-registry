@@ -34,8 +34,8 @@ mapping internally.
 Only pandas and polars-lazy compute EMA natively. PyArrow, DuckDB and SQLite
 have no native exponentially weighted compute and a Python emulation is
 forbidden by the CFW-backend rule, so they ship no backend for EMA (absence).
-Compute subclasses implement ``_compute_ema`` (the backend EWM) and
-``_assert_source_column_present`` (the guard).
+Compute subclasses implement ``_compute_ema`` (the backend EWM); the
+source-column presence guard is shared (``assert_source_columns_present``).
 """
 
 from __future__ import annotations
@@ -50,11 +50,13 @@ from mloda.provider import (
     FeatureSet,
     property_spec,
 )
-from mloda.user import Feature, FeatureName, Options
+from mloda.user import Feature
 
 from mloda.community.feature_groups.data_operations.base import (
     COLUMN_REF_EXPECTED,
     always_required,
+    assert_key_columns_present,
+    assert_source_columns_present,
     column_ref_value,
     is_column_ref,
 )
@@ -86,50 +88,6 @@ class EmaFeatureGroup(FeatureChainParserMixin, FeatureGroup):
             required_when=always_required,
         ),
     }
-
-    def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
-        _feature_name = str(feature_name)
-
-        prefix_patterns = self._get_prefix_patterns()
-        _operation_config, source_feature = FeatureChainParser.parse_feature_name(_feature_name, prefix_patterns)
-
-        if source_feature:
-            return {Feature(source_feature)}
-
-        in_features_set = options.get_in_features()
-        return set(in_features_set)
-
-    @classmethod
-    def _extract_source_features(cls, feature: Feature) -> list[str]:
-        """Extract and validate the single source feature.
-
-        Returns a one-element list containing the source column name. Raises
-        ``ValueError`` if more than one source feature is found, since EMA
-        supports at most one source column.
-        """
-        feature_name = feature.name
-        prefix_patterns = cls._get_prefix_patterns()
-
-        _operation_config, source_feature = FeatureChainParser.parse_feature_name(feature_name, prefix_patterns)
-
-        if source_feature:
-            return [source_feature]
-
-        in_features_set = feature.options.get_in_features()
-        source_names: list[str] = [str(f.name) for f in in_features_set]
-
-        if len(source_names) < cls.MIN_IN_FEATURES:
-            raise ValueError(
-                f"ema requires at least {cls.MIN_IN_FEATURES} source feature, "
-                f"but got {len(source_names)} (in_features is empty)."
-            )
-
-        if len(source_names) > cls.MAX_IN_FEATURES:
-            raise ValueError(
-                f"ema supports at most {cls.MAX_IN_FEATURES} source feature, but got {len(source_names)}: {source_names}"
-            )
-
-        return source_names
 
     @classmethod
     def _extract_span(cls, feature: Feature) -> int:
@@ -170,22 +128,16 @@ class EmaFeatureGroup(FeatureChainParserMixin, FeatureGroup):
         for feature in features.features:
             feature_name = feature.name
 
-            source_features = cls._extract_source_features(feature)
-            source_col = source_features[0]
+            source_col = cls._extract_single_source_feature(feature)
+            assert_source_columns_present(data, [source_col])
             span = cls._extract_span(feature)
             partition_by = cls._extract_partition_by(feature)
             order_by = cls._extract_order_by(feature)
-
-            cls._assert_source_column_present(table, source_col)
+            assert_key_columns_present(data, partition_by, order_by)
 
             table = cls._compute_ema(table, feature_name, source_col, span, partition_by, order_by)
 
         return table
-
-    @classmethod
-    def _assert_source_column_present(cls, data: Any, source_col: str) -> None:
-        """Reject a missing source column with a clear ``ValueError`` (backend-specific)."""
-        raise NotImplementedError
 
     @classmethod
     def _compute_ema(

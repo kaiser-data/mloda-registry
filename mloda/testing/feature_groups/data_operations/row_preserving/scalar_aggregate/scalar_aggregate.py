@@ -18,10 +18,16 @@ import pytest
 from mloda.provider import FeatureSet
 from mloda.user import Feature, Options
 
+from mloda.testing.data_creator.pyarrow import PyArrowDataOpsTestDataCreator
 from mloda.testing.feature_groups.data_operations.base import DataOpsTestBase
 from mloda.testing.feature_groups.data_operations.helpers import make_feature_set
+from mloda.testing.feature_groups.data_operations.mixins.input_validation import (
+    InputValidationCase,
+    InputValidationTestMixin,
+)
 from mloda.testing.feature_groups.data_operations.mixins.mask import MaskTestMixin
 from mloda.testing.feature_groups.data_operations.mixins.nan_policy import NanPolicyTestMixin
+from mloda.testing.feature_groups.data_operations.mixins.output_contract import OutputContractTestMixin
 
 # ---------------------------------------------------------------------------
 # Expected values (module-level constants)
@@ -85,8 +91,36 @@ NAN_DIVERGENT_SCALAR: dict[str, list[float]] = {
 # ---------------------------------------------------------------------------
 
 
-class ScalarAggregateTestBase(NanPolicyTestMixin, MaskTestMixin, DataOpsTestBase):
+class ScalarAggregateTestBase(
+    InputValidationTestMixin, OutputContractTestMixin, NanPolicyTestMixin, MaskTestMixin, DataOpsTestBase
+):
     """Abstract base class for scalar aggregate framework tests."""
+
+    # -- OutputContractTestMixin configuration ----------------------------------
+
+    def output_contract_feature_set(self) -> FeatureSet:
+        return make_feature_set("value_int__sum_scalar")
+
+    # -- InputValidationTestMixin configuration ---------------------------------
+
+    @classmethod
+    def input_validation_cases(cls) -> dict[str, Any]:
+        return {
+            "multi_column_in_features": InputValidationCase(
+                "bad_multi",
+                {"aggregation_type": "sum", "in_features": ["value_int", "value_float"]},
+                "at most 1",
+            ),
+            "missing_source_column": InputValidationCase(
+                "value_int__sum_scalar",
+                {},
+                "Source column 'value_int' is not present",
+                table=PyArrowDataOpsTestDataCreator.create().drop_columns(["value_int"]),
+            ),
+            "empty_partition_by": None,
+            "missing_partition_by_column": None,
+            "missing_order_by_column": None,
+        }
 
     ALL_AGG_TYPES = {
         "sum",
@@ -271,25 +305,6 @@ class ScalarAggregateTestBase(NanPolicyTestMixin, MaskTestMixin, DataOpsTestBase
         result_col = self.extract_column(result, "value_int__median_scalar")
         assert all(v == pytest.approx(EXPECTED_MEDIAN, rel=1e-6) for v in result_col)
 
-    def test_output_rows_equal_input_rows(self) -> None:
-        fs = make_feature_set("value_int__sum_scalar")
-        result = self.implementation_class().calculate_feature(self.test_data, fs)
-
-        assert self.get_row_count(result) == 12
-
-    def test_result_has_correct_type(self) -> None:
-        fs = make_feature_set("value_int__sum_scalar")
-        result = self.implementation_class().calculate_feature(self.test_data, fs)
-
-        assert isinstance(result, self.get_expected_type())
-
-    def test_new_column_added(self) -> None:
-        fs = make_feature_set("value_int__max_scalar")
-        result = self.implementation_class().calculate_feature(self.test_data, fs)
-
-        result_col = self.extract_column(result, "value_int__max_scalar")
-        assert len(result_col) == 12
-
     def test_broadcast_uniform(self) -> None:
         """All rows should have the same aggregated value."""
         fs = make_feature_set("value_int__sum_scalar")
@@ -360,26 +375,6 @@ class ScalarAggregateTestBase(NanPolicyTestMixin, MaskTestMixin, DataOpsTestBase
         result_col = self.extract_column(result, "my_max")
         assert all(v == EXPECTED_MAX for v in result_col)
         assert len(result_col) == 12
-
-    def test_multi_column_in_features_rejected_at_calculate(self) -> None:
-        """calculate_feature must reject features with multiple in_features.
-
-        This verifies the safety guard in _extract_source_features() that
-        prevents silent truncation to a single column.
-        """
-        feature = Feature(
-            "bad_multi",
-            options=Options(
-                context={
-                    "aggregation_type": "sum",
-                    "in_features": ["value_int", "value_float"],
-                }
-            ),
-        )
-        fs = FeatureSet()
-        fs.add(feature)
-        with pytest.raises(ValueError, match="at most 1"):
-            self.implementation_class().calculate_feature(self.test_data, fs)
 
     # -- Cross-framework comparison ------------------------------------------
 
