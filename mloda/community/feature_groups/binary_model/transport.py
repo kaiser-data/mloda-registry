@@ -222,7 +222,7 @@ class InvocationDirectory:
                 is_dir = stat.S_ISDIR(os.lstat(entry).st_mode)
             except OSError:
                 continue
-            if is_staging:
+            if match is None:
                 if is_dir:
                     _reap_if_unlocked(entry, require_lock=True)
                 continue
@@ -237,7 +237,8 @@ class InvocationDirectory:
                 with _OWNED_LOCK:
                     if entry in _OWNED_PATHS:
                         continue
-                if int(match.group(1)) == os.getpid() or not _windows_pid_alive(int(match.group(1))):  # type: ignore[union-attr]
+                pid = int(match.group(1))
+                if pid == os.getpid() or not _windows_pid_alive(pid):
                     shutil.rmtree(entry, ignore_errors=True)
                 continue
             _reap_if_unlocked(entry)

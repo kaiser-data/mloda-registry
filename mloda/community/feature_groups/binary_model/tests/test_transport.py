@@ -107,8 +107,7 @@ def _hold_lock(lock_file: Path) -> int:
 
 
 def _as_windows(monkeypatch: pytest.MonkeyPatch, alive: Callable[[int], bool]) -> None:
-    """Patch ``os.name`` to ``nt`` and stub the liveness helper; call it after every ``Path`` is built,
-    since ``Path(...)`` refuses to instantiate under ``nt`` on some Python versions."""
+    """Patch ``os.name`` to ``nt``; call after every ``Path`` is built, as ``Path`` may refuse to instantiate under ``nt``."""
     monkeypatch.setattr(transport, "_windows_pid_alive", alive, raising=False)
     monkeypatch.setattr(os, "name", "nt")
 
@@ -946,33 +945,42 @@ class TestRunBinary:
             output_bytes = _run_binary([*FAULTY_CMD, "--mode", "echo_env"], env, _hash_config(), b"", inv.path)
         assert json.loads(output_bytes) == sorted(env)
 
-    def test_non_executable_regular_file_raises_binary_unavailable(self, tmp_path: Path) -> None:
-        not_executable = tmp_path / "not-a-binary"
-        not_executable.write_text("not a script")
-        not_executable.chmod(0o600)
-        with InvocationDirectory(parent=tmp_path / TEMP_PARENT_NAME) as inv:
-            with pytest.raises(BinaryUnavailableError):
-                _run_binary([str(not_executable)], {"PATH": os.defpath}, _hash_config(), b"", inv.path)
-
-    @pytest.mark.skipif(os.name != "posix", reason="relies on the kernel rejecting an unrecognised executable format")
-    def test_executable_file_without_shebang_or_elf_header_raises_binary_unavailable(self, tmp_path: Path) -> None:
-        not_a_program = tmp_path / "not-a-program"
-        not_a_program.write_bytes(b"\x00\x01\x02 neither a shebang nor an ELF header\n")
-        not_a_program.chmod(0o700)
-        with InvocationDirectory(parent=tmp_path / TEMP_PARENT_NAME) as inv:
-            with pytest.raises(BinaryUnavailableError, match="cannot spawn binary"):
-                _run_binary([str(not_a_program)], {"PATH": os.defpath}, _hash_config(), b"", inv.path)
-
-    def test_spawn_failing_with_emfile_raises_binary_unavailable(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "non_executable_file",
+            pytest.param(
+                "executable_without_shebang_or_elf_header",
+                marks=pytest.mark.skipif(
+                    os.name != "posix", reason="relies on the kernel rejecting an unrecognised executable format"
+                ),
+            ),
+            "popen_raises_emfile",
+        ],
+    )
+    def test_non_executable_regular_file_raises_binary_unavailable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
     ) -> None:
-        def failing_popen(*args: Any, **kwargs: Any) -> Any:
-            raise OSError(errno.EMFILE, "too many open files")
+        cmd = STUB_CMD
+        if case == "non_executable_file":
+            not_executable = tmp_path / "not-a-binary"
+            not_executable.write_text("not a script")
+            not_executable.chmod(0o600)
+            cmd = [str(not_executable)]
+        elif case == "executable_without_shebang_or_elf_header":
+            not_a_program = tmp_path / "not-a-program"
+            not_a_program.write_bytes(b"\x00\x01\x02 neither a shebang nor an ELF header\n")
+            not_a_program.chmod(0o700)
+            cmd = [str(not_a_program)]
+        else:
 
-        with InvocationDirectory(parent=tmp_path / TEMP_PARENT_NAME) as inv:
+            def failing_popen(*args: Any, **kwargs: Any) -> Any:
+                raise OSError(errno.EMFILE, "too many open files")
+
             monkeypatch.setattr(subprocess, "Popen", failing_popen)
+        with InvocationDirectory(parent=tmp_path / TEMP_PARENT_NAME) as inv:
             with pytest.raises(BinaryUnavailableError, match="cannot spawn binary"):
-                _run_binary(STUB_CMD, {"PATH": os.defpath}, _hash_config(), b"", inv.path)
+                _run_binary(cmd, {"PATH": os.defpath}, _hash_config(), b"", inv.path)
 
     @pytest.mark.parametrize("target", ["config", "input"])
     def test_write_failure_in_the_invocation_directory_raises_binary_unavailable(

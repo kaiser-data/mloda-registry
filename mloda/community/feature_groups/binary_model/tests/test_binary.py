@@ -56,8 +56,7 @@ def _install_fake_module(
 ) -> None:
     """Injects a fake importable module into ``sys.modules`` exposing ``binary_path()``, so
     ``resolve_binary(plugin_id, None, ...)`` resolves it via ``importlib.import_module`` without
-    a real wheel installed (contract: Platform naming and wheel binary path). ``None`` leaves the
-    module without the attribute."""
+    a real wheel installed (contract: Platform naming and wheel binary path). ``None`` omits the attribute."""
     module = types.ModuleType(plugin_id)
     if binary_path is not None:
         module.binary_path = binary_path  # type: ignore[attr-defined]
