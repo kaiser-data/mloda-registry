@@ -35,6 +35,7 @@ import pytest
 from mloda.community.feature_groups.binary_model import binary
 from mloda.community.feature_groups.binary_model.contract import last_non_empty_stderr_line
 from mloda.community.feature_groups.binary_model.errors import BinaryUnavailableError, reported_error
+from mloda.community.feature_groups.binary_model.mixin import classify_column_type
 from mloda.community.feature_groups.binary_model.transport import minimal_environment
 from mloda.testing.binary_model import (
     COLUMN_TYPES,
@@ -106,6 +107,14 @@ __all__ = [
 # output or diagnostics, used to test that a marked input cell's value never leaks into stderr
 # (contract: Data handling).
 DATA_FREE_MARKER = "SECRET_MARKER_YlZ9qX7"
+
+# The int64 counterpart of the marker, for binaries without a utf8 column type.
+_DATA_FREE_INT_MARKER = 7391046218553917
+_UTF8_MARKER_CELL = (pa.string(), DATA_FREE_MARKER, DATA_FREE_MARKER.encode("utf-8"))
+_NO_MARKER_SKIP_REASON = (
+    "the default input schema's first field is not utf8 or int64: float text is not canonical across languages "
+    "and booleans carry no distinctive value"
+)
 
 # The contract's stderr soft cap (contract: Data handling). ``MESSAGE_MAX_BYTES`` (the `message`
 # field's own cap) is a contract constant shared with the binary itself, so it lives in
@@ -386,6 +395,21 @@ class BinaryModelConformanceBase:
         assert_output_contract(table, output_columns, expected_rows, self.column_types)
         return table
 
+    def _kit_assert_licensed_run_succeeds(self, config_path: Path, env: dict[str, str]) -> None:
+        rows = self.default_input_rows()
+        input_bytes = arrow_stream_bytes(self.default_input_schema(), rows)
+        result = self._kit_run_with_config(config_path, env, input_bytes)
+        self._kit_assert_success_table(result, self.make_config()["output_columns"], len(next(iter(rows.values()))))
+
+    def _kit_marker_cell(self) -> tuple[pa.DataType, Any, bytes] | None:
+        """The marker cell (type, value, stderr needle) for the default input schema's first field, or None."""
+        first_type = self.default_input_schema()[0].type
+        if classify_column_type(first_type, strict=True) == "utf8":
+            return _UTF8_MARKER_CELL
+        if pa.types.is_int64(first_type):
+            return pa.int64(), _DATA_FREE_INT_MARKER, str(_DATA_FREE_INT_MARKER).encode()
+        return None
+
     # -- Fixtures --
 
     def platform_env(self, env: dict[str, str]) -> dict[str, str]:
@@ -430,6 +454,18 @@ class BinaryModelConformanceBase:
             binary.parse_version(self.binary_cmd, self.plugin_id, result.stdout)
         except BinaryUnavailableError as exc:
             raise AssertionError(str(exc)) from exc
+
+    def test_default_input_schema_uses_advertised_column_types(self) -> None:
+        """Fails fast so a missing hook override is not reported as many code-4 failures (contract: Capabilities)."""
+        for field in self.default_input_schema():
+            classified = classify_column_type(field.type, strict=True)
+            if classified is None or classified not in self.column_types:
+                raise AssertionError(
+                    f"default_input_schema() field {field.name!r} has Arrow type {field.type}, which is not an "
+                    f"advertised column type (column_types={sorted(self.column_types)}). Override "
+                    "default_input_schema() and default_input_rows() with advertised types, and set column_types "
+                    "to what the binary advertises (utf8 must be pa.string(), its wire type)."
+                )
 
     def test_capabilities_prints_single_json_object_no_license_required(self, hermetic_env: dict[str, str]) -> None:
         """Unknown extra keys in the capabilities object are tolerated (contract: Invocation,
@@ -575,26 +611,23 @@ class BinaryModelConformanceBase:
     def test_license_accepted_via_license_file(
         self, valid_config_path: Path, valid_license_env: dict[str, str]
     ) -> None:
-        """A valid token via `MLODA_LICENSE_FILE` proceeds past the license check; whatever happens
-        next is never code 2 or 3 (contract: License)."""
-        result = self._kit_run_with_config(valid_config_path, valid_license_env)
-        assert_not_rejected_with(result, {LICENSE_MISSING, LICENSE_INVALID})
+        """A valid token via `MLODA_LICENSE_FILE` is accepted and the run succeeds with
+        contract-conforming output (contract: License)."""
+        self._kit_assert_licensed_run_succeeds(valid_config_path, valid_license_env)
 
     def test_license_accepted_via_license_key_inline(self, valid_config_path: Path) -> None:
-        """A valid token via `MLODA_LICENSE_KEY` (inline) is accepted the same as a file (contract:
-        License)."""
+        """A valid token via `MLODA_LICENSE_KEY` (inline) is accepted the same as a file and the run
+        succeeds (contract: License)."""
         env = self.platform_env({"MLODA_LICENSE_KEY": self.valid_license_text})
-        result = self._kit_run_with_config(valid_config_path, env)
-        assert_not_rejected_with(result, {LICENSE_MISSING, LICENSE_INVALID})
+        self._kit_assert_licensed_run_succeeds(valid_config_path, env)
 
     def test_license_file_wins_over_license_key(self, valid_config_path: Path, valid_license_file: Path) -> None:
         """When both are set, `MLODA_LICENSE_FILE` wins with no fallback to `MLODA_LICENSE_KEY`: a
-        valid file plus garbage inline key is still accepted (contract: License)."""
+        valid file plus garbage inline key is accepted and the run succeeds (contract: License)."""
         env = self.platform_env(
             {"MLODA_LICENSE_FILE": str(valid_license_file), "MLODA_LICENSE_KEY": "not-json-and-must-not-be-used"}
         )
-        result = self._kit_run_with_config(valid_config_path, env)
-        assert_not_rejected_with(result, {LICENSE_MISSING, LICENSE_INVALID})
+        self._kit_assert_licensed_run_succeeds(valid_config_path, env)
 
     def test_license_expired_is_invalid(self, valid_config_path: Path, tmp_path: Path) -> None:
         """An expired token: exit 3, license invalid (contract: License)."""
@@ -635,10 +668,7 @@ class BinaryModelConformanceBase:
         """An in-grace token (past ``exp``, inside ``grace_days``) is accepted and the run succeeds
         with contract-conforming output (spec: Verification step 6; contract: License)."""
         env = self.platform_env({"MLODA_LICENSE_KEY": self.in_grace_license_text})
-        rows = self.default_input_rows()
-        input_bytes = arrow_stream_bytes(self.default_input_schema(), rows)
-        result = self._kit_run_with_config(valid_config_path, env, input_bytes)
-        self._kit_assert_success_table(result, self.make_config()["output_columns"], len(next(iter(rows.values()))))
+        self._kit_assert_licensed_run_succeeds(valid_config_path, env)
 
     def test_license_not_yet_valid_is_invalid(self, valid_config_path: Path) -> None:
         """A token whose ``nbf`` lies in the future: exit 3, not yet valid (spec: Verification
@@ -1342,16 +1372,18 @@ class BinaryModelConformanceBase:
         """A distinctive marker cell value, sent through a normal successful run: stderr never
         contains it. stdout on a successful run legitimately carries the caller's own data by design,
         so this scopes the assertion to stderr only (contract: Data handling)."""
-        if "utf8" not in self.column_types:
-            pytest.skip("the marker cell is a string and this binary has no utf8 column type")
+        marker = self._kit_marker_cell()
+        if marker is None:
+            pytest.skip(_NO_MARKER_SKIP_REASON)
+        marker_type, marker_value, needle = marker
         column = self.default_input_columns[0]
         config = self.make_config(input_columns=[column])
         config_path = write_json(tmp_path / "config.json", config)
-        schema = pa.schema([pa.field(column, pa.string())])
-        input_bytes = arrow_stream_bytes(schema, {column: [DATA_FREE_MARKER]})
+        schema = pa.schema([pa.field(column, marker_type)])
+        input_bytes = arrow_stream_bytes(schema, {column: [marker_value]})
         result = self._kit_run_with_config(config_path, valid_license_env, input_bytes)
         assert result.returncode == 0, f"stderr={result.stderr!r}"
-        assert DATA_FREE_MARKER.encode("utf-8") not in result.stderr, (
+        assert needle not in result.stderr, (
             f"marker cell value leaked into stderr on a successful run: {result.stderr!r}"
         )
 
@@ -1368,6 +1400,8 @@ class BinaryModelConformanceBase:
         """The marker cell value through two failing cases that still reach the data stage: a data
         error from a wrong schema, and the reserved internal-error operation. Neither leaks the
         marker into stderr (contract: Data handling, Conformance)."""
+        marker = self._kit_marker_cell() or _UTF8_MARKER_CELL
+        marker_type, marker_value, needle = marker
         column = self.default_input_columns[0]
         if case == "missing_column_data_error":
             input_columns = [column, "col_b_missing"]
@@ -1379,13 +1413,11 @@ class BinaryModelConformanceBase:
             output_columns = {}
         config = self.make_config(input_columns=input_columns, operation=operation, output_columns=output_columns)
         config_path = write_json(tmp_path / "config.json", config)
-        schema = pa.schema([pa.field(column, pa.string())])
-        input_bytes = arrow_stream_bytes(schema, {column: [DATA_FREE_MARKER]})
+        schema = pa.schema([pa.field(column, marker_type)])
+        input_bytes = arrow_stream_bytes(schema, {column: [marker_value]})
         result = self._kit_run_with_config(config_path, valid_license_env, input_bytes)
         assert result.returncode != 0, f"expected this case to fail, got exit 0; stdout={result.stdout!r}"
-        assert DATA_FREE_MARKER.encode("utf-8") not in result.stderr, (
-            f"marker cell value leaked into stderr: {result.stderr!r}"
-        )
+        assert needle not in result.stderr, f"marker cell value leaked into stderr: {result.stderr!r}"
 
     def test_error_message_stays_under_size_cap_for_long_garbage_operation(
         self, valid_license_env: dict[str, str], tmp_path: Path
