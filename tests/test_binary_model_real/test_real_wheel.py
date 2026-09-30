@@ -2,7 +2,7 @@
 on PyPI) actually installed, instead of the simulated binary from
 ``mloda-testing[binary-model]``. Skipped unless the wheel is installed; the ``real-wheel`` CI job
 (``tox -e real-wheel``) installs the release wheel from the lock. See
-``docs/guides/feature-group-patterns/28-binary-backed-features.md``.
+``docs/guides/feature-group-patterns/29-binary-backed-features.md``.
 
 Run this directory on its own with ``pytest tests/test_binary_model_real/``; it needs no opt-in. The
 repo's other suites assume the wheel is absent and are not supported with it installed.

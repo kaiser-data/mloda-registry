@@ -1,7 +1,7 @@
 """Enterprise-wide licensing invariants: every enterprise plugin manifest must import with no
 binary wheel installed, and every plugin using ``BinaryModelMixin`` must reject up front without a
 license, never falling back to a Python computation (see
-``docs/guides/feature-group-patterns/28-binary-backed-features.md``).
+``docs/guides/feature-group-patterns/29-binary-backed-features.md``).
 """
 
 from __future__ import annotations

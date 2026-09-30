@@ -1,4 +1,4 @@
-"""Doc-drift guard for ``docs/guides/feature-group-patterns/28-binary-backed-features.md``, for the tox.ini and
+"""Doc-drift guard for ``docs/guides/feature-group-patterns/29-binary-backed-features.md``, for the tox.ini and
 ci.yaml wiring of the real-wheel suite, and for the documented ``uv sync`` setup commands. No mktestdocs/sybil-style
 execution of guide code fences is wired in this repo (confirmed), so these are lightweight grep-based checks
 instead of executed doctests."""
@@ -11,7 +11,7 @@ import shlex
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_GUIDE_PATH = _REPO_ROOT / "docs" / "guides" / "feature-group-patterns" / "28-binary-backed-features.md"
+_GUIDE_PATH = _REPO_ROOT / "docs" / "guides" / "feature-group-patterns" / "29-binary-backed-features.md"
 _TOX_INI = _REPO_ROOT / "tox.ini"
 _CI_WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "ci.yaml"
 _README = _REPO_ROOT / "README.md"
