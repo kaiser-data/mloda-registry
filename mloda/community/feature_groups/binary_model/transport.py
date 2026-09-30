@@ -17,6 +17,7 @@ import subprocess  # nosec
 import sys
 import tempfile
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import TracebackType
@@ -46,6 +47,8 @@ LOCK_FILE_NAME = ".lock"
 _SIBLING_PID_PATTERN = re.compile(r"^(\d+)-")
 _STAGING_PATTERN = re.compile(r"^\.tmp-[0-9a-f]+$")
 LOCK_INIT_FILE_NAME = ".lock-init"
+# A lock-less staging dir is held for microseconds by a live owner; older ones are abandoned.
+_STAGING_GRACE_SECONDS = 600.0
 
 
 def _windows_pid_alive(pid: int) -> bool:
@@ -121,7 +124,7 @@ def default_parent() -> Path:
 class InvocationDirectory:
     """A private, owner-only directory for one binary invocation, created under a per-user parent
     (or the given one) and reaping dead siblings on entry (contract: Data handling). Liveness is an exclusive
-    ``flock`` on a lock file inside the directory, held until exit (POSIX only)."""
+    ``flock`` on a lock file inside the directory, held until exit (POSIX), or the owner pid (Windows)."""
 
     def __init__(self, parent: Path | None = None) -> None:
         self.parent = parent if parent is not None else default_parent()
@@ -146,12 +149,15 @@ class InvocationDirectory:
             try:
                 path.mkdir(mode=0o700)
                 path.chmod(0o700)
-            except OSError as exc:
+            except BaseException as exc:
                 with _OWNED_LOCK:
                     _OWNED_PATHS.discard(path)
-                raise BinaryUnavailableError(
-                    f"cannot create an invocation directory under {self.parent}: {exc}"
-                ) from exc
+                shutil.rmtree(path, ignore_errors=True)
+                if isinstance(exc, OSError):
+                    raise BinaryUnavailableError(
+                        f"cannot create an invocation directory under {self.parent}: {exc}"
+                    ) from exc
+                raise
             self.path = path
             return self
         # Staged under a non-pid name so a reaper never sees a pid-named dir before it is locked.
@@ -163,9 +169,11 @@ class InvocationDirectory:
             staging.mkdir(mode=0o700)
             staging.chmod(0o700)
             self._lock_fd = _lock_file_fd(staging)
-            os.rename(staging, path)
-            with _OWNED_LOCK:
-                _OWNED_PATHS.discard(staging)
+            try:
+                os.rename(staging, path)
+            finally:
+                with _OWNED_LOCK:
+                    _OWNED_PATHS.discard(staging)
         except BaseException as exc:
             with _OWNED_LOCK:
                 _OWNED_PATHS.discard(path)
@@ -260,15 +268,21 @@ def _lock_file_fd(directory: Path) -> int:
 def _reap_if_unlocked(entry: Path, *, require_lock: bool = False) -> None:
     """Remove ``entry`` if its lock can be taken (owner dead) or it has no lock file (staging
     guarantees a live directory is locked once visible); keep it when locked or unreadable. With
-    ``require_lock`` a directory without a lock file is kept (a staging directory may be mid-creation)."""
+    ``require_lock`` a directory without a lock file is kept until it is older than the staging grace period."""
     with _OWNED_LOCK:
         if entry in _OWNED_PATHS:
             return
     try:
         fd = os.open(str(entry / LOCK_FILE_NAME), os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
     except FileNotFoundError:
-        if not require_lock:
-            shutil.rmtree(entry, ignore_errors=True)
+        if require_lock:
+            try:
+                stale = time.time() - os.lstat(entry).st_mtime > _STAGING_GRACE_SECONDS
+            except OSError:
+                return
+            if not stale:
+                return
+        shutil.rmtree(entry, ignore_errors=True)
         return
     except OSError:
         return
