@@ -7,6 +7,7 @@ handling, Errors).
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ import signal
 import stat
 import subprocess  # nosec
 import sys
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -23,6 +25,7 @@ from typing import Any
 import pyarrow as pa
 import pytest
 
+from mloda.community.feature_groups.binary_model import transport
 from mloda.community.feature_groups.binary_model.errors import (
     BinaryInternalError,
     BinaryTerminatedError,
@@ -32,18 +35,24 @@ from mloda.community.feature_groups.binary_model.errors import (
     OutputContractError,
     UnsupportedError,
 )
-from mloda.community.feature_groups.binary_model.tests.process_helpers import kill_descendant_if_running, pid_running
+from mloda.community.feature_groups.binary_model.tests.process_helpers import (
+    kill_descendant_if_running,
+    pid_is_alive,
+    pid_running,
+)
 from mloda.community.feature_groups.binary_model.transport import (
     TEMP_PARENT_NAME,
     InvocationDirectory,
     _terminate_timed_out_process,
     minimal_environment,
-    pid_is_alive,
     run_binary,
 )
 from mloda.testing.binary_model.arrow import arrow_stream_bytes, read_arrow_stream
 from mloda.testing.binary_model.hash_reference import compute_expected_hash_column
 from mloda.testing.binary_model.license_vectors import expired_license_token, valid_license_token
+
+if os.name == "posix":
+    import fcntl
 
 STUB_CMD = [sys.executable, "-m", "mloda.testing.binary_model.simulated_binary"]
 FAULTY_CMD = [sys.executable, "-m", "mloda.community.feature_groups.binary_model.tests.faulty_binary"]
@@ -87,6 +96,13 @@ def _dead_child_pid() -> int:
     proc = subprocess.Popen([sys.executable, "-c", "pass"])  # nosec B603
     proc.wait()
     return proc.pid
+
+
+def _hold_lock(lock_file: Path) -> int:
+    """Open ``lock_file`` (creating it) and take an exclusive flock on the returned fd; the caller closes it."""
+    fd = os.open(str(lock_file), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
 
 
 def _own_zombie_children() -> list[int]:
@@ -300,25 +316,77 @@ class TestInvocationDirectory:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Ownership can't be forged without root, so this simulates a foreign owner by wrapping
-        ``os.stat`` and reporting a different ``st_uid`` for the parent path only -- every other
+        ``os.lstat`` and reporting a different ``st_uid`` for the parent path only -- every other
         call (including pytest's and pathlib's own bookkeeping) goes through unmodified."""
         parent = tmp_path / TEMP_PARENT_NAME
         parent.mkdir(mode=0o700)
-        real_stat = os.stat
+        real_lstat = os.lstat
 
-        def fake_stat(path: Any, *, dir_fd: Any = None, follow_symlinks: bool = True) -> os.stat_result:
-            result = real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+        def fake_lstat(path: Any, *, dir_fd: Any = None) -> os.stat_result:
+            result = real_lstat(path, dir_fd=dir_fd)
             if Path(os.fspath(path)) != parent:
                 return result
             fields = list(result)
             fields[stat.ST_UID] = result.st_uid + 1
             return os.stat_result(fields)
 
-        monkeypatch.setattr(os, "stat", fake_stat)
+        monkeypatch.setattr(os, "lstat", fake_lstat)
         with pytest.raises(BinaryUnavailableError):
             with InvocationDirectory(parent=parent):
                 pass
 
+    @pytest.mark.skipif(os.name != "posix", reason="asserts POSIX symlinks")
+    def test_symlinked_parent_is_refused_and_its_target_left_untouched(self, tmp_path: Path) -> None:
+        victim = tmp_path / "victim"
+        victim.mkdir()
+        dead_dir = victim / f"{_dead_child_pid()}-taxes"
+        dead_dir.mkdir()
+        (dead_dir / "return.pdf").write_text("precious")
+        (dead_dir / transport.LOCK_FILE_NAME).write_text("")
+        (victim / "01-notes.md").write_text("notes")
+        before = sorted(victim.iterdir())
+        os.symlink(victim, tmp_path / TEMP_PARENT_NAME)
+        with pytest.raises(BinaryUnavailableError, match="symlink"):
+            with InvocationDirectory(parent=tmp_path / TEMP_PARENT_NAME):
+                pass
+        assert sorted(victim.iterdir()) == before
+        assert (dead_dir / "return.pdf").exists()
+
+    @pytest.mark.skipif(os.name != "posix", reason="asserts POSIX symlinks")
+    def test_dangling_symlink_parent_is_refused_as_unavailable(self, tmp_path: Path) -> None:
+        parent = tmp_path / TEMP_PARENT_NAME
+        os.symlink(tmp_path / "missing", parent)
+        with pytest.raises(BinaryUnavailableError):
+            with InvocationDirectory(parent=parent):
+                pass
+
+    @pytest.mark.skipif(os.name != "posix", reason="asserts the per-user POSIX parent name")
+    def test_default_parent_is_per_user_under_the_temp_dir(self) -> None:
+        assert transport.default_parent() == Path(tempfile.gettempdir()) / f"{TEMP_PARENT_NAME}-{os.getuid()}"
+
+    @pytest.mark.skipif(os.name != "posix", reason="asserts POSIX ownership")
+    def test_other_users_default_parent_does_not_block_the_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+        foreign = tmp_path / TEMP_PARENT_NAME
+        foreign.mkdir(mode=0o700)
+        real_lstat = os.lstat
+
+        def fake_lstat(path: Any, *, dir_fd: Any = None) -> os.stat_result:
+            result = real_lstat(path, dir_fd=dir_fd)
+            if Path(os.fspath(path)) != foreign:
+                return result
+            fields = list(result)
+            fields[stat.ST_UID] = result.st_uid + 1
+            return os.stat_result(fields)
+
+        monkeypatch.setattr(os, "lstat", fake_lstat)
+        with InvocationDirectory() as inv:
+            assert inv.path.parent == tmp_path / f"{TEMP_PARENT_NAME}-{os.getuid()}"
+            assert inv.path.is_dir()
+
+    @pytest.mark.skipif(os.name != "posix", reason="Windows never reaps")
     def test_dead_pid_file_sibling_is_reaped_on_enter(self, tmp_path: Path) -> None:
         """A sibling matching the ``<pid>-`` naming that is a regular FILE (not a directory) with a
         dead pid must also be removed: ``shutil.rmtree`` alone cannot delete a plain file."""
@@ -344,21 +412,129 @@ class TestInvocationDirectory:
         assert captured_path is not None
         assert not captured_path.exists()
 
-    def test_dead_pid_sibling_is_reaped_on_enter(self, tmp_path: Path) -> None:
+    @pytest.mark.skipif(os.name != "posix", reason="Windows never reaps")
+    def test_unlocked_sibling_is_reaped_on_enter(self, tmp_path: Path) -> None:
         parent = tmp_path / TEMP_PARENT_NAME
         parent.mkdir(parents=True)
         dead_sibling = parent / f"{_dead_child_pid()}-deadbeef"
         dead_sibling.mkdir()
+        (dead_sibling / transport.LOCK_FILE_NAME).write_text("")
         with InvocationDirectory(parent=parent):
             assert not dead_sibling.exists()
 
+    @pytest.mark.skipif(os.name != "posix", reason="asserts flock-based liveness")
     def test_alive_pid_sibling_is_kept(self, tmp_path: Path) -> None:
         parent = tmp_path / TEMP_PARENT_NAME
         parent.mkdir(parents=True)
         alive_sibling = parent / f"{os.getpid()}-aliveaaa"
         alive_sibling.mkdir()
+        fd = _hold_lock(alive_sibling / transport.LOCK_FILE_NAME)
+        try:
+            with InvocationDirectory(parent=parent):
+                assert alive_sibling.is_dir()
+        finally:
+            os.close(fd)
+
+    @pytest.mark.skipif(os.name != "posix", reason="asserts flock-based liveness")
+    def test_locked_sibling_with_a_dead_pid_name_is_kept(self, tmp_path: Path) -> None:
+        """Liveness is the lock, not the pid: a holder in another pid namespace looks dead by name."""
+        parent = tmp_path / TEMP_PARENT_NAME
+        parent.mkdir(parents=True)
+        sibling = parent / f"{_dead_child_pid()}-otherns"
+        sibling.mkdir()
+        fd = _hold_lock(sibling / transport.LOCK_FILE_NAME)
+        try:
+            with InvocationDirectory(parent=parent):
+                assert sibling.is_dir()
+        finally:
+            os.close(fd)
+
+    @pytest.mark.skipif(os.name != "posix", reason="asserts flock-based liveness")
+    def test_sibling_without_a_lock_file_is_reaped(self, tmp_path: Path) -> None:
+        """Staging locks a live directory before it is visible, so a lockless one is dead."""
+        parent = tmp_path / TEMP_PARENT_NAME
+        parent.mkdir(parents=True)
+        sibling = parent / f"{_dead_child_pid()}-nolock"
+        sibling.mkdir()
         with InvocationDirectory(parent=parent):
-            assert alive_sibling.is_dir()
+            assert not sibling.exists()
+
+    @pytest.mark.skipif(os.name != "posix", reason="asserts flock-based liveness")
+    def test_lock_file_is_held_exclusively_while_inside_the_block(self, tmp_path: Path) -> None:
+        with InvocationDirectory(parent=tmp_path / TEMP_PARENT_NAME) as inv:
+            lock_file = inv.path / transport.LOCK_FILE_NAME
+            assert lock_file.exists()
+            fd = os.open(str(lock_file), os.O_RDWR)
+            try:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+        assert not inv.path.exists()
+
+    @pytest.mark.skipif(os.name != "posix", reason="asserts flock-based liveness")
+    def test_no_pid_named_entry_is_visible_before_the_owner_locks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A reaper must never see an unlocked <pid>- sibling."""
+        parent = tmp_path / TEMP_PARENT_NAME
+        real_flock = fcntl.flock
+        visible_at_lock: list[str] = []
+        calls: list[int] = []
+
+        def spy_flock(fd: int, operation: int) -> None:
+            if operation & fcntl.LOCK_EX and parent.exists():
+                calls.append(operation)
+                visible_at_lock.extend(p.name for p in parent.iterdir() if re.match(r"^\d+-", p.name))
+            real_flock(fd, operation)
+
+        monkeypatch.setattr(fcntl, "flock", spy_flock)
+        with InvocationDirectory(parent=parent) as inv:
+            assert re.match(r"^\d+-", inv.path.name)
+        assert calls
+        assert visible_at_lock == []
+
+    @pytest.mark.skipif(os.name != "posix", reason="asserts flock-based liveness")
+    def test_owner_lock_is_non_blocking(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        real_flock = fcntl.flock
+        operations: list[int] = []
+
+        def spy_flock(fd: int, operation: int) -> None:
+            operations.append(operation)
+            real_flock(fd, operation)
+
+        monkeypatch.setattr(fcntl, "flock", spy_flock)
+        with InvocationDirectory(parent=tmp_path / TEMP_PARENT_NAME):
+            pass
+        assert operations
+        assert all(op & fcntl.LOCK_NB for op in operations)
+
+    @pytest.mark.skipif(os.name != "posix", reason="asserts flock-based liveness")
+    def test_lock_failure_is_unavailable_and_leaves_no_entry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        parent = tmp_path / TEMP_PARENT_NAME
+
+        def failing_flock(fd: int, operation: int) -> None:
+            raise OSError(errno.ENOLCK, "no locks")
+
+        monkeypatch.setattr(fcntl, "flock", failing_flock)
+        with pytest.raises(BinaryUnavailableError, match="lock"):
+            with InvocationDirectory(parent=parent):
+                pass
+        assert list(parent.iterdir()) == []
+
+    @pytest.mark.skipif(os.name != "posix", reason="asserts flock-based liveness")
+    def test_nested_instance_does_not_reap_the_outer_under_per_process_locks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Where flock is emulated as per-process record locks (NFS), the same process can retake its own lock."""
+        monkeypatch.setattr(fcntl, "flock", fcntl.lockf)
+        parent = tmp_path / TEMP_PARENT_NAME
+        with InvocationDirectory(parent=parent) as outer:
+            with InvocationDirectory(parent=parent):
+                assert outer.path.is_dir()
+            assert outer.path.is_dir()
 
     def test_non_matching_name_sibling_is_kept(self, tmp_path: Path) -> None:
         parent = tmp_path / TEMP_PARENT_NAME

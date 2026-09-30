@@ -12,8 +12,10 @@ import re
 import secrets
 import shutil
 import signal
+import stat
 import subprocess  # nosec
 import tempfile
+import threading
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import TracebackType
@@ -27,9 +29,18 @@ from mloda.community.feature_groups.binary_model.errors import (
     error_from_exit,
 )
 
+if os.name != "nt":
+    import fcntl
+
 logger = logging.getLogger(__name__)
 
+# Paths of live directories owned by this process. The reaper must not even open their lock files:
+# flock may be emulated as per-process record locks (e.g. NFS), so closing any fd drops the lock.
+_OWNED_PATHS: set[Path] = set()
+_OWNED_LOCK = threading.Lock()
+
 TEMP_PARENT_NAME = "mloda-binary"
+LOCK_FILE_NAME = ".lock"
 
 _SIBLING_PID_PATTERN = re.compile(r"^(\d+)-")
 
@@ -72,31 +83,29 @@ def minimal_environment(
     return env
 
 
-def pid_is_alive(pid: int) -> bool:
-    """Whether ``pid`` names a live process (contract: Data handling, orphan detection)."""
+def default_parent() -> Path:
+    """The default parent directory: per-user on POSIX so users never share one."""
+    base = Path(tempfile.gettempdir())
     if os.name == "nt":
-        # os.kill on Windows terminates the target process rather than merely signalling it, so a
-        # liveness check must never call it there; report conservatively alive to never reap.
-        return True
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+        return base / TEMP_PARENT_NAME
+    return base / f"{TEMP_PARENT_NAME}-{os.getuid()}"
 
 
 class InvocationDirectory:
-    """A private, owner-only directory for one binary invocation, created under a fixed parent
-    and reaping dead siblings on entry (contract: Data handling)."""
+    """A private, owner-only directory for one binary invocation, created under a per-user parent
+    (or the given one) and reaping dead siblings on entry (contract: Data handling). Liveness is an exclusive
+    ``flock`` on a lock file inside the directory, held until exit (POSIX only)."""
 
     def __init__(self, parent: Path | None = None) -> None:
-        self.parent = parent if parent is not None else Path(tempfile.gettempdir()) / TEMP_PARENT_NAME
+        self.parent = parent if parent is not None else default_parent()
         self.path: Path
+        self._lock_fd: int | None = None
 
     def __enter__(self) -> InvocationDirectory:
-        self.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            self.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        except OSError as exc:
+            raise BinaryUnavailableError(f"cannot create {self.parent}: {exc}") from exc
         if os.name != "nt":
             self._validate_parent()
 
@@ -104,17 +113,41 @@ class InvocationDirectory:
 
         name = f"{os.getpid()}-{secrets.token_hex(4)}"
         path = self.parent / name
-        path.mkdir(mode=0o700)
-        path.chmod(0o700)
+        if os.name == "nt":
+            path.mkdir(mode=0o700)
+            path.chmod(0o700)
+            self.path = path
+            return self
+        # Staged under a non-pid name so a reaper never sees a pid-named dir before it is locked.
+        staging = self.parent / f".tmp-{secrets.token_hex(8)}"
+        try:
+            staging.mkdir(mode=0o700)
+            staging.chmod(0o700)
+            self._lock_fd = _lock_file_fd(staging)
+            with _OWNED_LOCK:
+                _OWNED_PATHS.add(path)
+            os.rename(staging, path)
+        except BaseException as exc:
+            with _OWNED_LOCK:
+                _OWNED_PATHS.discard(path)
+            if self._lock_fd is not None:
+                os.close(self._lock_fd)
+                self._lock_fd = None
+            shutil.rmtree(staging, ignore_errors=True)
+            if isinstance(exc, OSError):
+                raise BinaryUnavailableError(f"cannot lock an invocation directory under {self.parent}: {exc}") from exc
+            raise
         self.path = path
         return self
 
     def _validate_parent(self) -> None:
-        """Refuse a parent not owned by the current user, world-writable, or writable by a group
-        other than the current process's own (contract: Data handling): a directory shared with
-        the process's own group, the common user-private-group scheme, is not a foreign-write
-        risk, but world-writable or a foreign group is."""
-        stat_result = os.stat(self.parent)
+        """Refuse a parent that is a symlink, not owned by the current user, world-writable, or
+        writable by a group other than the current process's own (contract: Data handling): a
+        directory shared with the process's own group, the common user-private-group scheme, is
+        not a foreign-write risk, but world-writable or a foreign group is."""
+        stat_result = os.lstat(self.parent)
+        if stat.S_ISLNK(stat_result.st_mode):
+            raise BinaryUnavailableError(f"refusing to use {self.parent}: a symlink")
         if stat_result.st_uid != os.getuid():
             raise BinaryUnavailableError(f"refusing to use {self.parent}: not owned by the current user")
         if stat_result.st_mode & 0o002:
@@ -129,26 +162,68 @@ class InvocationDirectory:
         traceback: TracebackType | None,
     ) -> None:
         shutil.rmtree(self.path, ignore_errors=True)
+        with _OWNED_LOCK:
+            _OWNED_PATHS.discard(self.path)
+        if self._lock_fd is not None:
+            os.close(self._lock_fd)
+            self._lock_fd = None
 
     def _reap_dead_siblings(self) -> None:
+        if os.name == "nt":
+            return
         try:
             entries = list(self.parent.iterdir())
         except OSError:
             return
         for entry in entries:
-            match = _SIBLING_PID_PATTERN.match(entry.name)
-            if match is None:
+            if _SIBLING_PID_PATTERN.match(entry.name) is None:
                 continue
-            pid = int(match.group(1))
-            if pid_is_alive(pid):
+            try:
+                is_dir = stat.S_ISDIR(os.lstat(entry).st_mode)
+            except OSError:
                 continue
-            if entry.is_dir():
-                shutil.rmtree(entry, ignore_errors=True)
-            else:
+            if not is_dir:
                 try:
                     os.unlink(entry)
                 except OSError:
-                    continue
+                    pass
+                continue
+            _reap_if_unlocked(entry)
+
+
+def _lock_file_fd(directory: Path) -> int:
+    fd = os.open(
+        str(directory / LOCK_FILE_NAME), os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600
+    )
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _reap_if_unlocked(entry: Path) -> None:
+    """Remove ``entry`` if its lock can be taken (owner dead) or it has no lock file (staging
+    guarantees a live directory is locked once visible); keep it when locked or unreadable."""
+    with _OWNED_LOCK:
+        if entry in _OWNED_PATHS:
+            return
+    try:
+        fd = os.open(str(entry / LOCK_FILE_NAME), os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        shutil.rmtree(entry, ignore_errors=True)
+        return
+    except OSError:
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return
+        shutil.rmtree(entry, ignore_errors=True)
+    finally:
+        os.close(fd)
 
 
 def _find_offending_parameter_key(config: Mapping[str, Any]) -> str | None:
