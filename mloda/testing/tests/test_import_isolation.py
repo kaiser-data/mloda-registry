@@ -1,15 +1,16 @@
-"""Direct unit test for mloda.testing.import_isolation.evict_package."""
+"""Direct unit tests for mloda.testing.import_isolation (evict_package, evict_root, evict_entry_points)."""
 
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 import sys
 import uuid
 from pathlib import Path
 
 import pytest
 
-from mloda.testing.import_isolation import evict_package, evict_root
+from mloda.testing.import_isolation import evict_entry_points, evict_package, evict_root
 
 
 def _write_throwaway_package(base: Path, name: str) -> None:
@@ -111,3 +112,42 @@ def test_evict_root_forces_a_genuine_cold_reimport_and_restores_the_original_mod
         assert reimported is not original
 
     assert sys.modules[package_name] is original
+
+
+@pytest.mark.parametrize("cold_parent_preloaded", [True, False], ids=["cold-parent-preloaded", "cold-parent-cold"])
+def test_evict_entry_points_removes_cold_loaded_entry_point_modules_and_keeps_already_loaded_ones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cold_parent_preloaded: bool
+) -> None:
+    """Cold-loaded entry point modules and their cold parents are evicted on teardown; loaded ones are kept."""
+    suffix = uuid.uuid4().hex
+    group = f"ii_throwaway_group_{suffix}"
+    cold_name = f"ii_throwaway_cold_{suffix}"
+    warm_name = f"ii_throwaway_warm_{suffix}"
+    for name in (cold_name, warm_name):
+        _write_throwaway_package(tmp_path, name)
+    dist_info = tmp_path / f"ii_throwaway_dist_{suffix}-0.0.0.dist-info"
+    dist_info.mkdir()
+    (dist_info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: ii-throwaway-dist-{suffix}\nVersion: 0.0.0\n")
+    (dist_info / "entry_points.txt").write_text(f"[{group}]\ncold = {cold_name}.leaf\nwarm = {warm_name}.leaf\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    cold_leaf = f"{cold_name}.leaf"
+    warm_leaf = f"{warm_name}.leaf"
+    warm_module = importlib.import_module(warm_leaf)
+    assert cold_leaf not in sys.modules
+    parent = importlib.import_module(cold_name) if cold_parent_preloaded else None
+
+    with pytest.MonkeyPatch.context() as mp:
+        evict_entry_points(mp, group)
+        for entry_point in importlib.metadata.entry_points(group=group):
+            entry_point.load()
+
+        assert cold_leaf in sys.modules
+        assert sys.modules[warm_leaf] is warm_module
+
+    assert cold_leaf not in sys.modules
+    assert sys.modules[warm_leaf] is warm_module
+    if cold_parent_preloaded:
+        assert not hasattr(parent, "leaf")
+    else:
+        assert cold_name not in sys.modules

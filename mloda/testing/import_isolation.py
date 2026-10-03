@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import importlib.util
 import pkgutil
 import sys
@@ -52,12 +53,8 @@ def evict_root(monkeypatch: pytest.MonkeyPatch, root: str) -> None:
             monkeypatch.delitem(sys.modules, name)
 
 
-def evict_package(monkeypatch: pytest.MonkeyPatch, dotted: str) -> None:
-    """Cold-evict ``dotted`` (and its manifest) from sys.modules and detach it from its parent package.
-
-    Also pre-registers removal for every sibling submodule the parent package could still cold-import,
-    and every submodule ``dotted`` itself could cold-import, during the test, so none of them leak.
-    """
+def _detach_from_parent(monkeypatch: pytest.MonkeyPatch, dotted: str) -> None:
+    """Queue teardown removal of the ``dotted`` leaf attribute from its parent package, if loaded."""
     parent_name, _, leaf = dotted.rpartition(".")
     parent = sys.modules.get(parent_name)
     if parent is not None:
@@ -65,6 +62,31 @@ def evict_package(monkeypatch: pytest.MonkeyPatch, dotted: str) -> None:
         # teardown overwrites whatever a cold import inside the test re-binds on the parent.
         monkeypatch.setattr(parent, leaf, None, raising=False)
         monkeypatch.delattr(parent, leaf, raising=False)
+
+
+def evict_entry_points(monkeypatch: pytest.MonkeyPatch, group: str) -> None:
+    """Pre-register teardown removal of every not-yet-loaded entry-point module in ``group``, plus its
+    not-yet-loaded parent packages."""
+    for entry_point in importlib.metadata.entry_points(group=group):
+        name = entry_point.module
+        if name in sys.modules:
+            continue
+        parts = name.split(".")
+        unloaded = [n for n in (".".join(parts[: i + 1]) for i in range(len(parts))) if n not in sys.modules]
+        for unloaded_name in unloaded:
+            monkeypatch.setitem(sys.modules, unloaded_name, None)
+            monkeypatch.delitem(sys.modules, unloaded_name, raising=False)
+        _detach_from_parent(monkeypatch, unloaded[0])
+
+
+def evict_package(monkeypatch: pytest.MonkeyPatch, dotted: str) -> None:
+    """Cold-evict ``dotted`` (and its manifest) from sys.modules and detach it from its parent package.
+
+    Also pre-registers removal for every sibling submodule the parent package could still cold-import,
+    and every submodule ``dotted`` itself could cold-import, during the test, so none of them leak.
+    """
+    parent_name = dotted.rpartition(".")[0]
+    _detach_from_parent(monkeypatch, dotted)
 
     evict_root(monkeypatch, dotted)
 
