@@ -183,7 +183,9 @@ class TestOtelExtenderConstructorOptions:
         assert result == 42
 
     def test_wraps_is_independent_of_raise_on_error_and_capture_content(self) -> None:
-        assert OtelExtender(raise_on_error=True, capture_content=True).wraps() == OtelExtender().wraps()
+        assert (
+            OtelExtender(raise_on_error=True, capture_content=True, mask=lambda v: v).wraps() == OtelExtender().wraps()
+        )
 
 
 class TestOtelExtenderPickledInertLogging:
@@ -682,6 +684,36 @@ class TestOtelExtenderFailureHandling:
         warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
         assert any("ValueError" in message and "mloda.calculate" in message for message in warnings), warnings
 
+    def test_warnings_name_the_subclass_not_the_base(
+        self, otel_capture: tuple[TracerProvider, InMemorySpanExporter], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Both the wrapped-failure and the post-call WARNING name type(self).__name__."""
+        provider, _ = otel_capture
+
+        class MyTracer(OtelExtender):
+            pass
+
+        def broken_mask(_value: Any) -> Any:
+            raise RuntimeError("mask boom")
+
+        def failing() -> None:
+            raise ValueError()
+
+        context = make_hook_context(hook=ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+        with caplog.at_level(logging.WARNING):
+            with context.activate():
+                with pytest.raises(ValueError):
+                    MyTracer(tracer_provider=provider)(failing)
+                with contextlib.suppress(Exception):
+                    MyTracer(tracer_provider=provider, capture_content=True, mask=broken_mask)(
+                        instrument(context, lambda: [1])
+                    )
+
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("MyTracer" in m and "ValueError" in m and "mloda.calculate" in m for m in warnings), warnings
+        assert any("MyTracer" in m and "post-call instrumentation failed" in m for m in warnings), warnings
+        assert not any(m.startswith("OtelExtender ") for m in warnings), warnings
+
 
 class TestOtelExtenderContentCapture:
     """Metadata-only by default; capture_content=True or MLODA_OTEL_TRACE_CONTENT opts in, mask redacts."""
@@ -709,7 +741,7 @@ class TestOtelExtenderContentCapture:
         monkeypatch.delenv("MLODA_OTEL_TRACE_CONTENT", raising=False)
         provider, exporter = otel_capture
         context = make_hook_context()
-        otel = OtelExtender(capture_content=True, tracer_provider=provider)
+        otel = OtelExtender(capture_content=True, mask=lambda v: v, tracer_provider=provider)
 
         def func() -> list[int]:
             return [1, 2, 3]
@@ -729,7 +761,7 @@ class TestOtelExtenderContentCapture:
         monkeypatch.setenv("MLODA_OTEL_TRACE_CONTENT", value)
         provider, exporter = otel_capture
         context = make_hook_context()
-        otel = OtelExtender(tracer_provider=provider)  # capture_content constructor arg left at default False
+        otel = OtelExtender(mask=lambda v: v, tracer_provider=provider)  # capture_content left at default None
 
         def func() -> list[int]:
             return [1, 2, 3]
@@ -745,13 +777,86 @@ class TestOtelExtenderContentCapture:
         monkeypatch.setenv("MLODA_OTEL_TRACE_CONTENT", "false")
         provider, exporter = otel_capture
         context = make_hook_context()
-        otel = OtelExtender(tracer_provider=provider)
+        otel = OtelExtender(mask=lambda v: v, tracer_provider=provider)
 
         def func() -> list[int]:
             return [1, 2, 3]
 
         with context.activate():
             otel(instrument(context, func))
+
+        assert _CONTENT_ATTRIBUTE not in single_span_attributes(exporter)
+
+    def test_explicit_false_beats_truthy_env_var(
+        self, otel_capture: tuple[TracerProvider, InMemorySpanExporter], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MLODA_OTEL_TRACE_CONTENT", "true")
+        provider, exporter = otel_capture
+        context = make_hook_context()
+        otel = OtelExtender(capture_content=False, mask=lambda v: v, tracer_provider=provider)
+
+        with context.activate():
+            otel(instrument(context, lambda: [1, 2, 3]))
+
+        assert _CONTENT_ATTRIBUTE not in single_span_attributes(exporter)
+
+    def test_capture_content_true_without_mask_raises_value_error(self) -> None:
+        with pytest.raises(
+            ValueError, match=r"OtelExtender.*capture_content.*mask|capture_content.*mask.*OtelExtender"
+        ):
+            OtelExtender(capture_content=True)
+
+    @pytest.mark.parametrize("value", ["true", "1"])
+    def test_env_truthy_without_mask_records_no_preview_and_warns_once(
+        self,
+        otel_capture: tuple[TracerProvider, InMemorySpanExporter],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        value: str,
+    ) -> None:
+        monkeypatch.setenv("MLODA_OTEL_TRACE_CONTENT", value)
+        provider, exporter = otel_capture
+        context = make_hook_context()
+        otel = OtelExtender(tracer_provider=provider)
+
+        with caplog.at_level(logging.WARNING):
+            with context.activate():
+                otel(instrument(context, lambda: [1, 2, 3]))
+                otel(instrument(context, lambda: [1, 2, 3]))
+
+        for span in exporter.get_finished_spans():
+            assert _CONTENT_ATTRIBUTE not in (span.attributes or {})
+        mask_warnings = [
+            r for r in caplog.records if r.levelno >= logging.WARNING and "mask" in r.message and "content" in r.message
+        ]
+        assert len(mask_warnings) == 1, caplog.text
+
+    def test_env_truthy_with_mask_records_masked_preview(
+        self, otel_capture: tuple[TracerProvider, InMemorySpanExporter], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MLODA_OTEL_TRACE_CONTENT", "true")
+        provider, exporter = otel_capture
+        context = make_hook_context()
+        otel = OtelExtender(mask=lambda _v: "***MASKED***", tracer_provider=provider)
+
+        with context.activate():
+            otel(instrument(context, lambda: "SECRET_VALUE_12345"))
+
+        attrs = single_span_attributes(exporter)
+        assert "***MASKED***" in str(attrs[_CONTENT_ATTRIBUTE])
+        assert "SECRET_VALUE_12345" not in str(attrs)
+
+    def test_attribute_set_true_after_construction_without_mask_records_no_preview(
+        self, otel_capture: tuple[TracerProvider, InMemorySpanExporter], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("MLODA_OTEL_TRACE_CONTENT", raising=False)
+        provider, exporter = otel_capture
+        context = make_hook_context()
+        otel = OtelExtender(tracer_provider=provider)
+        otel.capture_content = True
+
+        with context.activate():
+            otel(instrument(context, lambda: [1, 2, 3]))
 
         assert _CONTENT_ATTRIBUTE not in single_span_attributes(exporter)
 
@@ -764,7 +869,7 @@ class TestOtelExtenderContentCapture:
     ) -> None:
         provider, exporter = otel_capture
         context = make_hook_context(hook=hook)
-        otel = OtelExtender(capture_content=True, tracer_provider=provider)
+        otel = OtelExtender(capture_content=True, mask=lambda v: v, tracer_provider=provider)
 
         def func() -> list[int]:
             return [1, 2, 3]
@@ -779,7 +884,7 @@ class TestOtelExtenderContentCapture:
     ) -> None:
         provider, exporter = otel_capture
         context = make_hook_context()
-        otel = OtelExtender(capture_content=True, tracer_provider=provider)
+        otel = OtelExtender(capture_content=True, mask=lambda v: v, tracer_provider=provider)
 
         def func() -> None:
             raise RuntimeError("inner boom")
@@ -795,7 +900,7 @@ class TestOtelExtenderContentCapture:
     ) -> None:
         provider, exporter = otel_capture
         context = make_hook_context()
-        otel = OtelExtender(capture_content=True, tracer_provider=provider)
+        otel = OtelExtender(capture_content=True, mask=lambda v: v, tracer_provider=provider)
         raw = "x" * 10_000
 
         def func() -> str:
@@ -869,7 +974,7 @@ class TestOtelExtenderPostCallInstrumentationFailure:
     trace backend's point of view, from a real pipeline failure."""
 
     def test_mask_failure_after_func_success_does_not_mark_span_error(
-        self, otel_capture: tuple[TracerProvider, InMemorySpanExporter]
+        self, otel_capture: tuple[TracerProvider, InMemorySpanExporter], caplog: pytest.LogCaptureFixture
     ) -> None:
         provider, exporter = otel_capture
         context = make_hook_context(hook=ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
@@ -888,8 +993,13 @@ class TestOtelExtenderPostCallInstrumentationFailure:
         # func already succeeded by the time broken_mask runs, so whatever escapes here is the
         # extender's own bug, not func's; let it propagate and inspect the span it leaves behind.
         with context.activate():
-            with contextlib.suppress(Exception):
-                otel(instrument(context, func))
+            with caplog.at_level(logging.WARNING):
+                with contextlib.suppress(Exception):
+                    otel(instrument(context, func))
+
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("post-call instrumentation failed" in m and "RuntimeError" in m for m in warnings), warnings
+        assert "mask boom" not in caplog.text
 
         spans = exporter.get_finished_spans()
         assert len(spans) == 1, spans
@@ -917,7 +1027,7 @@ class TestOtelExtenderContentPreviewCost:
 
         provider, exporter = otel_capture
         context = make_hook_context()
-        otel = OtelExtender(capture_content=True, tracer_provider=provider)
+        otel = OtelExtender(capture_content=True, mask=lambda v: v, tracer_provider=provider)
 
         result = [_CountingItem() for _ in range(5000)]
         _CountingItem.calls = 0
@@ -1697,6 +1807,7 @@ class TestOtelExtenderClose:
 
         warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
         assert any("OtelExtender" in message for message in warnings), warnings
+        assert "flush boom" not in caplog.text
 
     def test_close_logs_a_warning_when_force_flush_returns_false(self, caplog: pytest.LogCaptureFixture) -> None:
         provider = Mock(force_flush=Mock(return_value=False))
