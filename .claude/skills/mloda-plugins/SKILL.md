@@ -125,6 +125,9 @@ Q30: Need to decide whether an option affects feature identity/resolution (group
 
 Q31: Need to define what feature names your FeatureGroup provides (beyond the default class name)?
     YES → See 13-feature-naming
+
+Q32: Is the model a compiled binary (shipped as a wheel, possibly license-gated) that must stay a black box?
+    YES → See 29-binary-backed-features
 ```
 
 ### Feature Group Pattern Guides
@@ -161,6 +164,7 @@ Location: `docs/guides/feature-group-patterns/`
 | 26 | `26-input-feature-forwarding.md` | Consume another group's root feature; option forwarding |
 | 27 | `27-input-data-readers.md` | Sibling reader selection; non-file / HTTP readers |
 | 28 | `28-backend-families.md` | Pick one sibling backend: name, discriminator option, or reader |
+| 29 | `29-binary-backed-features.md` | Compiled, license-gated binary as a black-box model over Arrow IPC |
 
 ---
 
