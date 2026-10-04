@@ -7,13 +7,16 @@ subclass them to run the same checks against their own binary.
   ``unittest.TestCase``, so pytest collects it once subclassed under a ``Test*`` name.
 - ``HashOperationConformanceMixin``: every "hash"-operation-specific check, mixed in alongside the
   base class for a binary whose worked example is "hash".
+- ``HmacSha256OperationConformanceMixin``: every "hmac_sha256"-operation-specific check (one utf8
+  input column, a required 64-hex ``key``, lowercase-hex utf8 output), mixed in the same way.
 
 Every overridable input (binary command, plugin_id, operations, column-type vocabulary, license
 fixtures, config shape) is a class attribute or method on ``self``, never a module constant or
 pytest fixture, so subclassing with different attributes retargets the whole kit.
 
 Re-exports the lower-level mechanics these classes build on: Arrow IPC stream mechanics
-(``arrow.py``), the "hash" reference algorithm (``hash_reference.py``), and the signed
+(``arrow.py``), the "hash" and "hmac_sha256" reference algorithms (``hash_reference.py``,
+``hmac_sha256_reference.py``), and the signed
 license-token vectors and builders (``license_vectors.py``).
 """
 
@@ -48,6 +51,7 @@ from mloda.testing.binary_model import (
     UNSUPPORTED,
     USAGE_ERROR,
     hash_reference,
+    hmac_sha256_reference,
     license_vectors,
 )
 
@@ -101,6 +105,7 @@ __all__ = [
     "write_text",
     "BinaryModelConformanceBase",
     "HashOperationConformanceMixin",
+    "HmacSha256OperationConformanceMixin",
 ]
 
 # A distinctive marker string, chosen so it would never otherwise appear in this suite's input,
@@ -1819,3 +1824,274 @@ class HashOperationConformanceMixin(BinaryModelConformanceBase):
         config = self.make_config(parameters={"key": "x", "unexpected_extra_key": 1})
         result = self._kit_run_with_config(write_json(tmp_path / "config.json", config), valid_license_env)
         assert_error_response(result, USAGE_ERROR)
+
+
+# =============================================================================
+# HmacSha256OperationConformanceMixin -- "hmac_sha256" operation-specific checks
+# =============================================================================
+
+
+class HmacSha256OperationConformanceMixin(BinaryModelConformanceBase):
+    """Every check specific to "hmac_sha256": a required 64-hex ``key``, one utf8 input column, lowercase-hex
+    utf8 output, nulls stay null. Subclass order matches ``HashOperationConformanceMixin``: mixin first."""
+
+    operations: ClassVar[list[str]] = ["hmac_sha256"]
+    default_output_columns: ClassVar[dict[str, str]] = {"result": "col_a_token"}
+    hmac_key: ClassVar[str] = "42" * 32
+
+    def make_config(
+        self,
+        *,
+        input_columns: list[str] | None = None,
+        operation: str | None = None,
+        parameters: dict[str, Any] | None = None,
+        output_columns: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        if parameters is None and (operation is None or operation == self.operations[0]):
+            parameters = {hmac_sha256_reference.KEY_PARAMETER: self.hmac_key}
+        return super().make_config(
+            input_columns=input_columns, operation=operation, parameters=parameters, output_columns=output_columns
+        )
+
+    def default_output_column_type(self) -> pa.DataType:
+        return pa.string()
+
+    def _assert_key_not_echoed(self, result: subprocess.CompletedProcess[bytes], key: str) -> None:
+        """The key never appears in stderr, nor in stdout when the run failed."""
+        assert key.encode() not in result.stderr, "stderr echoes the key"
+        if result.returncode != 0:
+            assert key.encode() not in result.stdout, "stdout echoes the key"
+
+    def _hmac_run(
+        self, env: dict[str, str], tmp_path: Path, rows: list[str | None], key: str | None = None
+    ) -> pa.Table:
+        """Run the default config (optionally with ``key``) over one utf8 column and return the output table."""
+        parameters = None if key is None else {hmac_sha256_reference.KEY_PARAMETER: key}
+        config = self.make_config(parameters=parameters)
+        column = self.default_input_columns[0]
+        input_bytes = arrow_stream_bytes(pa.schema([pa.field(column, pa.string())]), {column: rows})
+        result = self._kit_run_with_config(write_json(tmp_path / "config.json", config), env, input_bytes)
+        self._assert_key_not_echoed(result, key or self.hmac_key)
+        return self._kit_assert_success_table(result, config["output_columns"], len(rows))
+
+    # -------------------------------------------------------------------------------------------
+    # M1. "hmac_sha256" values (contract: Configuration "hmac_sha256" operation shape; Data)
+    # -------------------------------------------------------------------------------------------
+
+    def test_hmac_known_answer(self, valid_license_env: dict[str, str], tmp_path: Path) -> None:
+        """A fixed key and value give the literal known digest (contract: Configuration)."""
+        table = self._hmac_run(
+            valid_license_env,
+            tmp_path,
+            [hmac_sha256_reference.KNOWN_ANSWER_VALUE],
+            key=hmac_sha256_reference.KNOWN_ANSWER_KEY,
+        )
+        expected = [hmac_sha256_reference.KNOWN_ANSWER_DIGEST]
+        assert table.column(self.default_output_column_name).to_pylist() == expected
+
+    def test_hmac_matches_reference(self, valid_license_env: dict[str, str], tmp_path: Path) -> None:
+        """Output matches the reference row for row; nulls stay null, digests are 64 lowercase hex (contract: Data)."""
+        rows: list[str | None] = ["alice", None, "", "über", "alice"]
+        actual = self._hmac_run(valid_license_env, tmp_path, rows).column(self.default_output_column_name).to_pylist()
+        assert actual == hmac_sha256_reference.compute_expected_hmac_sha256_column(rows, self.hmac_key)
+        assert actual[1] is None
+        assert actual[0] == actual[4]
+        for token in (value for value in actual if value is not None):
+            assert re.fullmatch(r"[0-9a-f]{64}", token), f"not 64 lowercase hex characters: {token!r}"
+
+    def test_hmac_is_deterministic(self, valid_license_env: dict[str, str], tmp_path: Path) -> None:
+        """The same input run twice gives byte-identical stdout (contract: Data)."""
+        config = self.make_config()
+        config_path = write_json(tmp_path / "config.json", config)
+        column = self.default_input_columns[0]
+        input_bytes = arrow_stream_bytes(pa.schema([pa.field(column, pa.string())]), {column: ["alice", None, "bob"]})
+        first = self._kit_run_with_config(config_path, valid_license_env, input_bytes)
+        second = self._kit_run_with_config(config_path, valid_license_env, input_bytes)
+        assert first.returncode == 0, f"stderr={first.stderr!r}"
+        assert first.stdout == second.stdout
+        self._assert_key_not_echoed(first, self.hmac_key)
+        self._assert_key_not_echoed(second, self.hmac_key)
+
+    def test_hmac_multi_batch_input_processes_all_batches(
+        self, valid_license_env: dict[str, str], tmp_path: Path
+    ) -> None:
+        """Two record batches give the reference values across the boundary (contract: Data)."""
+        config = self.make_config()
+        column = self.default_input_columns[0]
+        schema = pa.schema([pa.field(column, pa.string())])
+        batch_one: list[str | None] = ["alice", None]
+        batch_two: list[str | None] = ["bob", "über", "alice"]
+        input_bytes = arrow_stream_bytes_multi_batch(schema, [{column: batch_one}, {column: batch_two}])
+        result = self._kit_run_with_config(write_json(tmp_path / "config.json", config), valid_license_env, input_bytes)
+        self._assert_key_not_echoed(result, self.hmac_key)
+        table = self._kit_assert_success_table(result, config["output_columns"], len(batch_one) + len(batch_two))
+        expected = hmac_sha256_reference.compute_expected_hmac_sha256_column(batch_one + batch_two, self.hmac_key)
+        assert table.column(self.default_output_column_name).to_pylist() == expected
+
+    def test_hmac_different_key_changes_every_token(self, valid_license_env: dict[str, str], tmp_path: Path) -> None:
+        """A different key changes every non-null token (contract: Configuration)."""
+        rows: list[str | None] = ["alice", None, "bob"]
+        first = self._hmac_run(valid_license_env, tmp_path, rows).column(self.default_output_column_name).to_pylist()
+        other_key = "43" * 32
+        second = (
+            self._hmac_run(valid_license_env, tmp_path, rows, key=other_key)
+            .column(self.default_output_column_name)
+            .to_pylist()
+        )
+        assert second[1] is None
+        for before, after in zip(first, second):
+            assert before == after if before is None else before != after
+
+    def test_hmac_uppercase_hex_key_equals_lowercase(self, valid_license_env: dict[str, str], tmp_path: Path) -> None:
+        """An uppercase hex key gives the same tokens as its lowercase form (contract: Configuration)."""
+        key = "ab" * 32
+        rows: list[str | None] = ["alice", None, "bob"]
+        lower = self._hmac_run(valid_license_env, tmp_path, rows, key=key)
+        upper = self._hmac_run(valid_license_env, tmp_path, rows, key=key.upper())
+        name = self.default_output_column_name
+        assert upper.column(name).to_pylist() == lower.column(name).to_pylist()
+
+    def test_hmac_output_schema_exact_type_utf8_no_input_columns_echoed(
+        self, valid_license_env: dict[str, str], tmp_path: Path
+    ) -> None:
+        """Output schema is exactly the written name, typed utf8; no input column is echoed (contract: Data)."""
+        table = self._hmac_run(valid_license_env, tmp_path, ["alice", "bob"])
+        assert table.schema.names == [self.default_output_column_name]
+        assert pa.types.is_string(table.schema.field(self.default_output_column_name).type)
+
+    # -------------------------------------------------------------------------------------------
+    # M2. Input and `parameters.key` rejection (contract: Configuration, Capabilities, Errors)
+    # -------------------------------------------------------------------------------------------
+
+    def test_hmac_non_utf8_input_column_is_unsupported(self, valid_license_env: dict[str, str], tmp_path: Path) -> None:
+        """An int64 input column is rejected as unsupported (contract: Capabilities)."""
+        column = self.default_input_columns[0]
+        config_path = write_json(tmp_path / "config.json", self.make_config())
+        input_bytes = arrow_stream_bytes(pa.schema([pa.field(column, pa.int64())]), {column: [1, 2]})
+        result = self._kit_run_with_config(config_path, valid_license_env, input_bytes)
+        assert_error_response(result, UNSUPPORTED)
+        self._assert_key_not_echoed(result, self.hmac_key)
+
+    def test_hmac_two_input_columns_is_usage_error(self, valid_license_env: dict[str, str], tmp_path: Path) -> None:
+        """ "hmac_sha256" takes exactly one input column (contract: Configuration)."""
+        config = self.make_config(input_columns=[self.default_input_columns[0], self.extra_input_column])
+        result = self._kit_run_with_config(write_json(tmp_path / "config.json", config), valid_license_env)
+        assert_error_response(result, USAGE_ERROR)
+        self._assert_key_not_echoed(result, self.hmac_key)
+
+    @pytest.mark.parametrize(
+        "bad_key",
+        [
+            pytest.param("11" * 31 + "1", id="63_hex_chars"),
+            pytest.param("11" * 32 + "1", id="65_hex_chars"),
+            pytest.param("zz" * 32, id="non_hex_chars"),
+            pytest.param("11 " * 21 + "1", id="embedded_spaces"),
+            pytest.param(1234, id="non_string"),
+            pytest.param(None, id="null"),
+            pytest.param("", id="empty"),
+        ],
+    )
+    def test_hmac_bad_key_is_usage_error_and_never_echoed(
+        self, valid_license_env: dict[str, str], tmp_path: Path, bad_key: Any
+    ) -> None:
+        """A key that is not exactly 64 hex characters is a usage error, and stderr never contains it
+        (contract: Configuration, Errors, Data handling)."""
+        config = self.make_config(parameters={hmac_sha256_reference.KEY_PARAMETER: bad_key})
+        result = self._kit_run_with_config(write_json(tmp_path / "config.json", config), valid_license_env)
+        assert_error_response(result, USAGE_ERROR)
+        if isinstance(bad_key, str) and bad_key:
+            self._assert_key_not_echoed(result, bad_key)
+
+    def test_hmac_unknown_extra_parameter_is_usage_error(
+        self, valid_license_env: dict[str, str], tmp_path: Path
+    ) -> None:
+        """An unknown parameter next to a valid key is a usage error (contract: Configuration)."""
+        config = self.make_config(
+            parameters={hmac_sha256_reference.KEY_PARAMETER: self.hmac_key, "unexpected_extra_key": 1}
+        )
+        result = self._kit_run_with_config(write_json(tmp_path / "config.json", config), valid_license_env)
+        assert_error_response(result, USAGE_ERROR)
+        self._assert_key_not_echoed(result, self.hmac_key)
+
+    def test_hmac_missing_key_is_usage_error(self, valid_license_env: dict[str, str], tmp_path: Path) -> None:
+        """`parameters: {}` lacks the required key, a usage error (contract: Configuration)."""
+        config = self.make_config(parameters={})
+        result = self._kit_run_with_config(write_json(tmp_path / "config.json", config), valid_license_env)
+        assert_error_response(result, USAGE_ERROR)
+
+    # -------------------------------------------------------------------------------------------
+    # M3. Base checks restated for one input column and a required key
+    # -------------------------------------------------------------------------------------------
+
+    def test_config_parameters_empty_object_accepted_structurally(
+        self, valid_license_env: dict[str, str], tmp_path: Path
+    ) -> None:
+        """Deliberately inverts the base expectation: `parameters: {}` lacks the required key, so it
+        is a usage error (contract: Configuration)."""
+        # Mirrors the base test of the same name, which assumes all parameters are optional.
+        self.test_hmac_missing_key_is_usage_error(valid_license_env, tmp_path)
+
+    def test_input_schema_missing_column_is_data_error(self, valid_license_env: dict[str, str], tmp_path: Path) -> None:
+        """A stream missing the one configured column is a data error (contract: Data)."""
+        # Mirrors the base test of the same name, which configures two input columns.
+        config_path = write_json(tmp_path / "config.json", self.make_config())
+        schema = pa.schema([pa.field(self.extra_input_column, pa.string())])
+        input_bytes = arrow_stream_bytes(schema, {self.extra_input_column: ["alice", "bob"]})
+        result = self._kit_run_with_config(config_path, valid_license_env, input_bytes)
+        assert_error_response(result, DATA_ERROR)
+
+    def test_input_schema_duplicate_field_name_is_data_error(
+        self, valid_license_env: dict[str, str], tmp_path: Path
+    ) -> None:
+        """The one configured column carried twice is a "duplicate", a data error (contract: Data)."""
+        # Mirrors the base test of the same name, which configures two input columns.
+        column = self.default_input_columns[0]
+        config_path = write_json(tmp_path / "config.json", self.make_config())
+        schema = pa.schema([pa.field(column, pa.string()), pa.field(column, pa.string())])
+        values = pa.array(["alice", "bob"], type=pa.string())
+        input_bytes = arrow_stream_bytes_from_arrays(schema, [values, values])
+        result = self._kit_run_with_config(config_path, valid_license_env, input_bytes)
+        assert_error_response(result, DATA_ERROR)
+
+    def test_input_schema_presence_error_precedes_type_error(
+        self, valid_license_env: dict[str, str], tmp_path: Path
+    ) -> None:
+        """A missing configured column plus a wrongly typed other field is a data error, not code 4
+        (contract: Data)."""
+        # Mirrors the base test of the same name, which configures two input columns.
+        config_path = write_json(tmp_path / "config.json", self.make_config())
+        schema = pa.schema([pa.field(self.extra_input_column, pa.int32())])
+        input_bytes = arrow_stream_bytes(schema, {self.extra_input_column: [1, 2]})
+        result = self._kit_run_with_config(config_path, valid_license_env, input_bytes)
+        assert_error_response(result, DATA_ERROR)
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            pytest.param("missing_column_data_error", id="missing_column_data_error"),
+            pytest.param("reserved_internal_error_operation", id="reserved_internal_error_operation"),
+        ],
+    )
+    def test_diagnostics_never_leak_marked_cell_value_on_failure(
+        self, valid_license_env: dict[str, str], tmp_path: Path, case: str
+    ) -> None:
+        """The marker cell through two failing data-stage cases never leaks into stderr
+        (contract: Data handling, Conformance)."""
+        # Mirrors the base test of the same name, whose two-column config stops at the config stage here.
+        marker_type, marker_value, needle = self._kit_marker_cell() or _UTF8_MARKER_CELL
+        column = self.default_input_columns[0]
+        if case == "missing_column_data_error":
+            config = self.make_config(input_columns=[column])
+            schema = pa.schema([pa.field(self.extra_input_column, marker_type)])
+            input_bytes = arrow_stream_bytes(schema, {self.extra_input_column: [marker_value]})
+        else:
+            config = self.make_config(
+                input_columns=[column], operation=self.reserved_internal_error_operation, output_columns={}
+            )
+            input_bytes = arrow_stream_bytes(pa.schema([pa.field(column, marker_type)]), {column: [marker_value]})
+        result = self._kit_run_with_config(write_json(tmp_path / "config.json", config), valid_license_env, input_bytes)
+        if case == "missing_column_data_error":
+            assert_error_response(result, DATA_ERROR)
+        else:
+            assert result.returncode != 0, f"expected this case to fail, got exit 0; stdout={result.stdout!r}"
+        assert needle not in result.stderr, f"marker cell value leaked into stderr: {result.stderr!r}"
