@@ -4,6 +4,7 @@ core's own instrumentation."""
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
@@ -11,6 +12,7 @@ import os
 import pickle  # nosec
 import re
 import stat
+import sys
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import AbstractContextManager
@@ -38,8 +40,10 @@ from mloda.enterprise.extenders.audit import (
     SealedRunRefusedError,
     TeeAuditSink,
     manifest_hash,
+    rotate_ndjson_segment,
     seal_ndjson_runs,
     seal_run,
+    verify_ndjson_log,
     verify_ndjson_log_coverage,
 )
 from mloda.enterprise.extenders.audit import audit_extender as audit_extender_module
@@ -220,6 +224,23 @@ def _refuser_pickled_second_instance(tmp_path: Path, fail_closed: bool) -> tuple
     """A pickled copy of a fresh second instance: it has no signer, only the shared manifest_path."""
     second, audit_path = _refuser_second_instance(tmp_path, fail_closed)
     return pickle.loads(pickle.dumps(second)), audit_path  # nosec
+
+
+def _rotated_after_run_1(tmp_path: Path, **kwargs: Any) -> tuple[AuditExtender, Path, Path]:
+    """An extender (genesis log_id "log-a") that sealed run-1, then a segment rotation under the same signer."""
+    audit_path, manifest_path = _sealing_config(tmp_path)
+    _append_records(audit_path, [_minimal_audit_record("run-1")])
+    extender = AuditExtender(
+        NdjsonAuditSink(audit_path),
+        audit_path=audit_path,
+        manifest_path=manifest_path,
+        signer=_hmac_signer(),
+        log_id="log-a",
+        **kwargs,
+    )
+    extender.on_run_complete("run-1")
+    rotate_ndjson_segment(audit_path, manifest_path, signer=_hmac_signer(), log_id="log-a")
+    return extender, audit_path, manifest_path
 
 
 def _torn_garbage_tail(audit_path: Path, manifest_path: Path, signer: Any) -> str:
@@ -1546,6 +1567,55 @@ class TestAuditExtenderSealing:
         assert call.calls == 0
         assert audit_path.read_bytes() == before  # no deny record either, in either posture
 
+    @pytest.mark.parametrize("indexed", [False, True], ids=["no_index", "index"])
+    def test_a_run_sealed_in_an_archived_segment_is_refused_after_a_rotation(
+        self, tmp_path: Path, indexed: bool
+    ) -> None:
+        extra: dict[str, Any] = {"seal_index_path": tmp_path / "index.sqlite"} if indexed else {}
+        extender, audit_path, manifest_path = _rotated_after_run_1(tmp_path, **extra)
+        with make_hook_context(run_id="run-2", tenant_id=_TENANT).activate():
+            extender(_CountingCall())
+        extender.on_run_complete("run-2")  # seals in the new segment, so the index is rebuilt
+        second = _second_extender_over_same_sealing_config(audit_path, manifest_path, _hmac_signer(), **extra)
+        call = _CountingCall()
+        before = audit_path.read_bytes()
+
+        with make_hook_context(run_id="run-1", tenant_id=_TENANT).activate():
+            with pytest.raises(SealedRunRefusedError):
+                second(call)
+
+        assert call.calls == 0
+        assert audit_path.read_bytes() == before
+
+    def test_on_run_complete_for_a_run_sealed_in_an_archived_segment_is_not_a_seal_failure(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _, audit_path, manifest_path = _rotated_after_run_1(tmp_path)
+        second = _second_extender_over_same_sealing_config(audit_path, manifest_path, _hmac_signer(), log_id="log-a")
+
+        with caplog.at_level(logging.INFO):
+            second.on_run_complete("run-1")
+
+        assert second.seal_failures == 0
+        assert any(r.levelno == logging.INFO and "already sealed" in r.getMessage() for r in caplog.records)
+
+    def test_an_auto_seal_after_a_rotation_succeeds_while_the_anchor_still_holds_the_old_head(
+        self, tmp_path: Path
+    ) -> None:
+        anchor = NdjsonHeadAnchor(tmp_path / "anchor.ndjson")
+        extender, audit_path, manifest_path = _rotated_after_run_1(tmp_path, head_anchor=anchor)
+        old_head = anchor.latest()
+        assert old_head is not None
+
+        with make_hook_context(run_id="run-2", tenant_id=_TENANT).activate():
+            extender(_CountingCall())
+        extender.on_run_complete("run-2")
+
+        assert extender.seal_failures == 0
+        assert json.loads(manifest_path.read_text(encoding="utf-8").splitlines()[-1])["run_id"] == "run-2"
+        assert anchor.latest() != old_head
+        verify_ndjson_log(audit_path, manifest_path, signer=_hmac_signer(), log_id="log-a", anchored_heads=[old_head])
+
     def test_second_instance_reads_the_manifest_log_at_most_once_per_run_id(self, tmp_path: Path) -> None:
         sealing_instance, audit_path = _extender_with_run_1_sealed(tmp_path)
         _, manifest_path = _sealing_config(tmp_path)
@@ -2827,6 +2897,52 @@ class TestNdjsonAuditSink:
             sink.write({"a": "x" * 100})
 
         assert path.read_bytes() == before
+
+    def test_a_write_whose_file_was_swapped_after_opening_lands_in_the_new_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fcntl = pytest.importorskip("fcntl")
+        path = tmp_path / "audit.ndjson"
+        archive = tmp_path / "audit.ndjson.000001"
+        path.write_bytes(b'{"old": 1}\n')
+        new = tmp_path / "new.ndjson"
+        new.write_bytes(b'{"carried": 1}\n')
+        swapped: list[int] = []
+        real_flock = fcntl.flock
+
+        def flock(fd: int, operation: int) -> None:
+            if not swapped:
+                os.link(path, archive)
+                os.replace(new, path)
+                swapped.append(operation)
+            real_flock(fd, operation)
+
+        monkeypatch.setattr(fcntl, "flock", flock)
+
+        NdjsonAuditSink(path).write({"a": 1})
+
+        assert swapped == [fcntl.LOCK_SH]
+        assert path.read_bytes() == b'{"carried": 1}\n{"a": 1}\n'
+        assert archive.read_bytes() == b'{"old": 1}\n'
+
+    @pytest.mark.parametrize("failure", ["no-fcntl", "flock-error"])
+    def test_the_record_is_written_without_a_lock_when_locking_is_unavailable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+    ) -> None:
+        fcntl = pytest.importorskip("fcntl")
+        path = tmp_path / "audit.ndjson"
+        if failure == "no-fcntl":
+            monkeypatch.setitem(sys.modules, "fcntl", None)
+        else:
+
+            def unsupported(fd: int, operation: int) -> None:
+                raise OSError(errno.ENOLCK, "no locks")
+
+            monkeypatch.setattr(fcntl, "flock", unsupported)
+
+        NdjsonAuditSink(path).write({"a": 1})
+
+        assert path.read_bytes() == b'{"a": 1}\n'
 
     def test_short_write_raises_os_error_naming_the_path(self, tmp_path: Path) -> None:
         path = tmp_path / "audit.ndjson"

@@ -25,11 +25,13 @@ from mloda.enterprise.extenders.audit.run_manifest import (
     quarantine_damaged_lines,
     quarantine_from_rotation_entry,
     rotate_manifest_key,
+    rotate_ndjson_segment,
     seal_ndjson_runs,
     seal_run,
     verify_manifest,
     verify_ndjson_log,
     verify_ndjson_log_coverage,
+    verify_ndjson_segments,
     verify_quarantine_log,
 )
 
@@ -56,10 +58,12 @@ __all__ = [
     "quarantine_damaged_lines",
     "quarantine_from_rotation_entry",
     "rotate_manifest_key",
+    "rotate_ndjson_segment",
     "seal_ndjson_runs",
     "seal_run",
     "verify_manifest",
     "verify_ndjson_log",
     "verify_ndjson_log_coverage",
+    "verify_ndjson_segments",
     "verify_quarantine_log",
 ]
