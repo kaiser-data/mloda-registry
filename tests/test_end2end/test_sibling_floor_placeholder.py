@@ -126,8 +126,9 @@ def test_version_placeholder_expands_to_shared_version() -> None:
         "mloda_community_data_operations>=0.4.4",
         "MLODA-Community-Data-Operations>=0.4.4",
         f'{_DEP}>=0.4.4; python_version>="3.11"',
+        f"{_DEP}~=0.4.4",
     ],
-    ids=["gte-pin", "exact-pin", "bare", "underscores", "mixed-case", "env-marker"],
+    ids=["gte-pin", "exact-pin", "bare", "underscores", "mixed-case", "env-marker", "hand-pinned-tilde"],
 )
 def test_hand_pinned_sibling_dependency_is_rejected(dependency: str) -> None:
     """A sibling dependency written without the {version} placeholder must raise ValueError naming
@@ -148,14 +149,13 @@ def test_hand_pinned_sibling_dependency_is_rejected(dependency: str) -> None:
     [
         f"{_DEP}>=0.4.0,<={{version}}",
         f"{_DEP}>=0.4.4,<{{version}}",
-        f"{_DEP}~={{version}}",
         f"{_DEP}=={{version}}",
         f'{_DEP}>=0.4.4; python_version>="{{version}}"',
     ],
-    ids=["extra-upper-bound", "extra-lower-bound", "tilde-operator", "exact-operator", "placeholder-in-marker-only"],
+    ids=["extra-upper-bound", "extra-lower-bound", "exact-operator", "placeholder-in-marker-only"],
 )
 def test_malformed_version_placeholder_specifier_is_rejected(dependency: str, request: pytest.FixtureRequest) -> None:
-    """{version} alone isn't enough: the specifier (marker stripped) must be exactly '<name>[extras]>={version}'."""
+    """{version} alone isn't enough: the specifier (marker stripped) must be exactly '<name>[extras]>={version}' or '~={version}'."""
     shared, _packages_config = gen.load_configs()
     packages = _synthetic_packages(dependency)
 
@@ -194,16 +194,24 @@ def test_version_placeholder_outside_a_sibling_floor_is_rejected(dependency: str
     assert dependency in message, f"error message must name the offending dependency {dependency!r}, got: {message}"
 
 
-def test_version_placeholder_with_extras_is_accepted() -> None:
-    """A sibling requirement may carry extras before the floor operator: '<name>[extras]>={version}'."""
+@pytest.mark.parametrize("operator", [">=", "~="], ids=["floor", "compatible-release"])
+@pytest.mark.parametrize("suffix", ["", "[all]"], ids=["plain", "with-extras"])
+@pytest.mark.parametrize("via_extra", [False, True], ids=["dependencies", "extra"])
+def test_version_placeholder_spelling_is_accepted_and_expanded(operator: str, suffix: str, via_extra: bool) -> None:
+    """A sibling may be written '<name>[extras]>={version}' or '<name>[extras]~={version}', in 'dependencies' or an extra."""
     shared, _packages_config = gen.load_configs()
-    dependency = f"{_DEP}[all]>={{version}}"
-    packages = _synthetic_packages(dependency)
+    dependency = f"{_DEP}{suffix}{operator}{{version}}"
+    expected = f"{_DEP}{suffix}{operator}{shared['project']['version']}"
 
-    deps = _generated_dependencies(_LEAF, packages, shared)
-
-    expected = f"{_DEP}[all]>={shared['project']['version']}"
-    assert deps == [expected], f"expected exactly [{expected!r}], got {deps!r}"
+    if via_extra:
+        packages = _synthetic_packages(f"{_DEP}>={{version}}")
+        packages[_LEAF]["optional_dependencies"] = {"all": [dependency]}
+        opts = _generated_optional_dependencies(_LEAF, packages, shared)
+        assert opts.get("all") == [expected], f"expected [{expected!r}], got {opts.get('all')!r}"
+    else:
+        packages = _synthetic_packages(dependency)
+        deps = _generated_dependencies(_LEAF, packages, shared)
+        assert deps == [expected], f"expected exactly [{expected!r}], got {deps!r}"
 
 
 def test_optional_dependency_bare_sibling_is_unchanged() -> None:

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import ast
 import inspect
 import json
 import logging
 import os
+import sys
+import textwrap
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
@@ -679,6 +682,40 @@ class OpenLineageExtenderTestMixin(ExtenderContractTestMixin):
         assert result == [1, 2, 3]
         assert func_calls == 1
 
+    def test_openlineage_raise_on_error_never_applies_the_breaker(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client, _ = make_recording_client()
+        extender = self.make_openlineage_extender(client, raise_on_error=True)
+        original_emit = client.emit
+        calls = 0
+
+        def flaky_emit(event: Event) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                original_emit(event)
+                return
+            raise ConnectionError("transport boom")
+
+        monkeypatch.setattr(client, "emit", flaky_emit)
+        run_id = "00000000-0000-4000-8000-0000000000c1"
+        hook = ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE
+
+        with make_hook_context(hook=hook, run_id=run_id).activate():
+            result = extender(lambda: [1, 2, 3])
+        assert result == [1, 2, 3]
+
+        func_calls = 0
+
+        def func() -> int:
+            nonlocal func_calls
+            func_calls += 1
+            return 1
+
+        with make_hook_context(hook=hook, run_id=run_id).activate():
+            with pytest.raises(ConnectionError):
+                extender(func)
+        assert func_calls == 0
+
     def test_openlineage_run_all_events_share_one_parent_run_id(self) -> None:
         client, transport = make_recording_client()
         run_two_features(self.make_openlineage_extender(client))
@@ -775,3 +812,137 @@ class OpenLineageExtenderTestMixin(ExtenderContractTestMixin):
                 if value != producer
             ]
             assert not offending, offending
+
+
+_POSITIONAL = inspect.Parameter.POSITIONAL_OR_KEYWORD
+_VAR_POSITIONAL = inspect.Parameter.VAR_POSITIONAL
+_VAR_KEYWORD = inspect.Parameter.VAR_KEYWORD
+_KEYWORD_ONLY = inspect.Parameter.KEYWORD_ONLY
+
+_Param = tuple[str, inspect._ParameterKind, bool]
+
+
+def _p(name: str, kind: inspect._ParameterKind = _POSITIONAL, has_default: bool = False) -> _Param:
+    return (name, kind, has_default)
+
+
+# Each parameter is (name, kind, has_default). Ship a seam change as a `minor:` commit: mloda-enterprise pins
+# mloda-community-openlineage~={version}.
+OPENLINEAGE_EXTENDER_SEAMS: dict[str, tuple[_Param, ...]] = {
+    "_dispatch": (_p("self"), _p("context"), _p("func"), _p("args"), _p("kwargs")),
+    "_call_input_data_load": (
+        _p("self"),
+        _p("context"),
+        _p("func"),
+        _p("args", _VAR_POSITIONAL),
+        _p("kwargs", _VAR_KEYWORD),
+    ),
+    "_call_calculate_feature": (
+        _p("self"),
+        _p("context"),
+        _p("func"),
+        _p("args", _VAR_POSITIONAL),
+        _p("kwargs", _VAR_KEYWORD),
+    ),
+    "_calculate_run_facets": (_p("self"), _p("context"), _p("func"), _p("args")),
+    "_calculate_output_facets": (_p("self"), _p("context"), _p("func"), _p("args"), _p("name"), _p("inputs")),
+    "_run_with_events": (
+        _p("self"),
+        _p("func"),
+        _p("args"),
+        _p("kwargs"),
+        _p("job", _KEYWORD_ONLY),
+        _p("run_facets", _KEYWORD_ONLY),
+        _p("declared_inputs", _KEYWORD_ONLY),
+        _p("build_inputs", _KEYWORD_ONLY, True),
+        _p("build_outputs", _KEYWORD_ONLY, True),
+    ),
+}
+
+OPENLINEAGE_EXTENDER_ATTRIBUTE_SEAMS: tuple[str, ...] = ("producer", "job_namespace", "dataset_namespace")
+
+
+_DUNDER_OVERRIDE_DENY_LIST = (
+    "__getstate__",
+    "__setstate__",
+    "__call__",
+    "__reduce__",
+    "__reduce_ex__",
+    "__copy__",
+    "__deepcopy__",
+    "__getattr__",
+    "__getattribute__",
+    "__setattr__",
+    "__delattr__",
+    "__del__",
+)
+
+
+def _is_private(name: str) -> bool:
+    return name.startswith("_") and not name.startswith("__") and not name.endswith("__")
+
+
+def _assert_no_private_access(klass: type, base: type, private_names: set[str]) -> None:
+    """Fail if klass's body touches a private base member or module internal that is not a seam, or reassigns a
+    private base name in the class body (class body only; getattr with a string is not seen)."""
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(klass)))
+    except (OSError, TypeError) as exc:
+        raise AssertionError(f"cannot read the source of {klass.__name__} to check its private access: {exc}") from exc
+    base_module = sys.modules[base.__module__]
+    klass_globals = sys.modules[klass.__module__].__dict__
+    for class_def in tree.body:
+        if not isinstance(class_def, ast.ClassDef):
+            continue
+        for statement in class_def.body:
+            targets = statement.targets if isinstance(statement, ast.Assign) else []
+            if isinstance(statement, ast.AnnAssign):
+                targets = [statement.target]
+            for assigned in targets:
+                if isinstance(assigned, ast.Name) and assigned.id in private_names:
+                    raise AssertionError(f"{klass.__name__} assigns {assigned.id}, a private member of {base.__name__}")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and _is_private(node.attr):
+            target = node.value
+            if node.attr in private_names:
+                raise AssertionError(f"{klass.__name__} uses {node.attr}, a private member of {base.__name__}")
+            if isinstance(target, ast.Name) and klass_globals.get(target.id) is base_module:
+                raise AssertionError(f"{klass.__name__} uses {target.id}.{node.attr}, a private name of its module")
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and _is_private(node.id):
+            internal = base_module.__dict__.get(node.id)
+            if internal is not None and klass_globals.get(node.id) is internal:
+                raise AssertionError(f"{klass.__name__} uses {node.id}, a private name of the {base.__name__} module")
+
+
+def assert_openlineage_extender_seams(cls: type, base: type) -> None:
+    """Assert cls keeps every seam and overrides no other private base member; cls() must work with no arguments."""
+    for name, expected in OPENLINEAGE_EXTENDER_SEAMS.items():
+        method = getattr(cls, name, None)
+        assert callable(method), f"{cls.__name__} is missing the method seam {name}"
+        actual = tuple(
+            _p(p.name, p.kind, p.default is not inspect.Parameter.empty)
+            for p in inspect.signature(method).parameters.values()
+        )
+        assert actual == expected, f"{cls.__name__}.{name} changed its parameters: expected {expected}, got {actual}"
+
+    instance = cls()
+    for attribute in OPENLINEAGE_EXTENDER_ATTRIBUTE_SEAMS:
+        assert hasattr(instance, attribute), f"{cls.__name__}() is missing the attribute seam {attribute}"
+
+    private_names = {
+        name for name in {*dir(base), *vars(base())} if _is_private(name) and name not in OPENLINEAGE_EXTENDER_SEAMS
+    }
+    for klass in cls.__mro__:
+        if klass is base:
+            break
+        _assert_no_private_access(klass, base, private_names)
+        for name in _DUNDER_OVERRIDE_DENY_LIST:
+            if name in vars(klass):
+                raise AssertionError(f"{klass.__name__} overrides {name}, which a subclass must not override")
+        for name, value in vars(klass).items():
+            is_private = _is_private(name)
+            is_member = callable(value) or isinstance(value, (property, classmethod, staticmethod))
+            if is_private and is_member and hasattr(base, name) and name not in OPENLINEAGE_EXTENDER_SEAMS:
+                raise AssertionError(
+                    f"{klass.__name__} overrides {name}, which is not a declared seam of {base.__name__}"
+                )
