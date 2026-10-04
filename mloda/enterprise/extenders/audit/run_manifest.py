@@ -36,6 +36,15 @@ Limits:
   Still a hand repair (truncate the log back to an anchored head): a terminated undecodable or duplicate-key line
   mid-log, a rotation entry lacking only its newline, a seal signed by a non-current keyring key, and a rotation
   entry as the first line (no anchored head to go back to).
+- Without a seal index every auto-seal verifies the whole manifest log and parses the whole audit file. With
+  `seal_index_path` a seal resumes from a signed checkpoint and no longer re-verifies lines before it, so run
+  verify_ndjson_log(anchored_heads=...) on a schedule; an anchor lagging behind the checkpoint falls back to full
+  verification. Re-running a sealed run and manual sweeps stay full scans. The digest cost is the bytes from the
+  run's first record to EOF; runs left pending (crashed, or refused at plan time) stay so until swept. Negative
+  lookups trust the index's unsigned hint rows: whoever can write the index can make a sealed run look unsealed and
+  cause a duplicate seal, so keep it under the logs' write protection and verify offline on a schedule.
+- A line longer than MAX_LINE_BYTES (64 MiB) fails verification and is refused on write, which bounds a seal to
+  roughly a million records per run. Logs written by earlier releases with a seal line over the cap no longer verify.
 - Sealing and verifying need the log's current key to be `signer` (an archived log verifies with its current key).
   The check is load-bearing: it stops an unused keyring key from taking the log over.
 - verify_manifest on a single manifest cannot order keys.
@@ -55,13 +64,14 @@ import re
 import stat
 import tempfile
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, suppress
-from dataclasses import asdict, dataclass
+from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Sequence
+from contextlib import closing, contextmanager, suppress
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
+from itertools import islice
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import IO, TYPE_CHECKING, Any, Protocol
 
 from mloda.enterprise.extenders.audit._records import (
     _append_records,
@@ -75,6 +85,7 @@ if TYPE_CHECKING:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 _MANIFEST_VERSION = 2
+MAX_LINE_BYTES = 64 * 1024 * 1024
 _V1 = 1
 _QUARANTINE_VERSION = 2
 _HASH_ALGORITHM = "sha256"
@@ -520,8 +531,46 @@ def _decode_line(where: str, line: bytes) -> Any:
         raise ManifestVerificationError(f"{where} is not valid JSON: {exc}") from exc
 
 
-def _parse_ndjson_line(path: str | Path, number: int, raw: bytes) -> tuple[bytes, dict[str, Any]]:
-    where = f"{path} line {number}"
+class _OversizedLine(bytes):
+    """A line longer than the cap: no content, only its full size, sha256 and whether a newline ended it."""
+
+    size: int
+    sha256: str
+    terminated: bool
+
+    def __bool__(self) -> bool:
+        return True
+
+
+def _line_size(raw: bytes) -> int:
+    return raw.size if isinstance(raw, _OversizedLine) else len(raw)
+
+
+def _is_terminated(raw: bytes) -> bool:
+    return raw.terminated if isinstance(raw, _OversizedLine) else raw.endswith(b"\n")
+
+
+def _read_lines(file: IO[bytes]) -> Iterator[bytes]:
+    """Yield the raw lines of `file`, never holding more than MAX_LINE_BYTES + 1 bytes of one line."""
+    chunk = MAX_LINE_BYTES + 1
+    while raw := file.readline(chunk):
+        if len(raw) < chunk or raw.endswith(b"\n"):
+            yield raw
+            continue
+        digest, size, last = hashlib.sha256(raw), len(raw), raw
+        while last and not last.endswith(b"\n"):
+            last = file.readline(chunk)
+            digest.update(last)
+            size += len(last)
+        line = _OversizedLine()
+        line.size, line.sha256, line.terminated = size, digest.hexdigest(), last.endswith(b"\n")
+        yield line
+
+
+def _parse_ndjson_line(path: str | Path, number: int | str, raw: bytes) -> tuple[bytes, dict[str, Any]]:
+    where = f"{path} line {number}" if isinstance(number, int) else f"{path} {number}"
+    if isinstance(raw, _OversizedLine):
+        raise ManifestVerificationError(f"{where} is longer than {MAX_LINE_BYTES} bytes")
     if not raw.endswith(b"\n"):
         raise ManifestVerificationError(f"{where} does not end with a newline")
     line = raw[:-1]
@@ -531,9 +580,10 @@ def _parse_ndjson_line(path: str | Path, number: int, raw: bytes) -> tuple[bytes
     return line, obj
 
 
-def _read_ndjson(path: str | Path) -> Iterator[tuple[bytes, dict[str, Any]]]:
+def _read_ndjson(path: str | Path, start: int = 0, number: int = 1) -> Iterator[tuple[bytes, dict[str, Any]]]:
     with open(path, "rb") as file:
-        for number, raw in enumerate(file, start=1):
+        file.seek(start)
+        for number, raw in enumerate(_read_lines(file), start=number):
             yield _parse_ndjson_line(path, number, raw)
 
 
@@ -545,16 +595,14 @@ def _iter_manifests(path: str | Path) -> Iterator[dict[str, Any]]:
         return
 
 
-def _is_run_sealed_unverified(manifest_path: str | Path, run_id: str) -> bool:
-    """Unverified read without the lock: a seal holds the exclusive lock while it digests the whole audit
-    log, so a calculation must not wait on it. True iff a line naming run_id decodes to a JSON object with
-    that run_id; a line that does not decode (torn, or mid-append) is skipped, not treated as sealed; a
-    decodable one, even unterminated, counts."""
+def _scan_for_run(manifest_path: str | Path, run_id: str, start: int = 0) -> bool:
+    """Byte-scan the manifest lines from `start` for a decodable JSON object with `run_id`."""
     needle = json.dumps(run_id).encode("utf-8")
     try:
         with open(manifest_path, "rb") as file:
-            for raw in file:
-                if needle not in raw:
+            file.seek(start)
+            for raw in _read_lines(file):
+                if isinstance(raw, _OversizedLine) or needle not in raw:
                     continue
                 try:
                     manifest = _decode_line(str(manifest_path), raw.rstrip(b"\n"))
@@ -565,6 +613,19 @@ def _is_run_sealed_unverified(manifest_path: str | Path, run_id: str) -> bool:
     except FileNotFoundError:
         return False
     return False
+
+
+def _is_run_sealed_unverified(manifest_path: str | Path, run_id: str, index_path: str | Path | None = None) -> bool:
+    """Unverified read without the lock: a seal holds the exclusive lock while it digests the audit log, so a
+    calculation must not wait on it. True iff a line naming run_id decodes to a JSON object with
+    that run_id; a line that does not decode (torn, or mid-append) is skipped, not treated as sealed; a
+    decodable one, even unterminated, counts. With `index_path` (read-only, no signature check) a hint hit is
+    confirmed at its offset and only the bytes after the checkpoint are scanned; anything unusable scans it all."""
+    if index_path is not None:
+        found = _indexed_lookup(manifest_path, run_id, index_path)
+        if found is not None:
+            return found
+    return _scan_for_run(manifest_path, run_id)
 
 
 def _read_manifests(path: str | Path) -> list[dict[str, Any]]:
@@ -590,20 +651,54 @@ def _check_run_against_seal(
     _verify_digest(manifest, _digest_runs(audit_path, run_id.__eq__).get(run_id, _RunDigest()))
 
 
+class _AuditScan:
+    """How far the audit file was scanned: the end offset and line count, the last line's start and sha256, and the
+    first record (offset, line number) of each run seen."""
+
+    def __init__(self, dev: int, ino: int) -> None:
+        self.dev, self.ino = dev, ino
+        self.end = self.count = self.last_start = 0
+        self.last_sha256 = ""
+        self.first: dict[str, tuple[int, int]] = {}
+
+    @classmethod
+    def fresh(cls, path: str | Path) -> _AuditScan:
+        stat_result = os.stat(path)
+        return cls(stat_result.st_dev, stat_result.st_ino)
+
+    def note(self, line: bytes, run_id: str | None, sealed: Container[str] = ()) -> None:
+        self.count += 1
+        if run_id is not None and not _is_blank(run_id) and run_id not in sealed:
+            self.first.setdefault(run_id, (self.end, self.count))
+        self.last_start = self.end
+        self.last_sha256 = _sha256(line + b"\n")
+        self.end += len(line) + 1
+
+
+def _record_run_id(record: Mapping[str, Any]) -> str | None:
+    run_id = record.get("run_id")
+    if run_id is not None and not isinstance(run_id, str):
+        raise ManifestVerificationError(f"audit record run_id {run_id!r} is neither a string nor null")
+    return run_id
+
+
 def _digest_runs(
     audit_path: str | Path,
     keep: Callable[[str], bool],
     uncovered: _Uncovered | None = None,
     *,
     track_times: bool = False,
+    start: int = 0,
+    number: int = 1,
+    scan: _AuditScan | None = None,
 ) -> dict[str, _RunDigest]:
     if uncovered is None:
         uncovered = _Uncovered()
     digests: dict[str, _RunDigest] = {}
-    for line, record in _read_ndjson(audit_path):
-        run_id = record.get("run_id")
-        if run_id is not None and not isinstance(run_id, str):
-            raise ManifestVerificationError(f"audit record run_id {run_id!r} is neither a string nor null")
+    for line, record in _read_ndjson(audit_path, *((start, number) if start else ())):
+        run_id = _record_run_id(record)
+        if scan is not None:
+            scan.note(line, run_id)
         if run_id is None or _is_blank(run_id):
             uncovered.unattributed += 1
             continue
@@ -662,6 +757,9 @@ class _LogState:
     active: str | None
     retired: frozenset[str]
     hashes: set[str]
+    seen_v2: bool = False
+    log_id: str | None = None
+    lines: int = 0
 
 
 def _unverified_anchor(anchors: Iterable[str], hashes: set[str]) -> str | None:
@@ -679,18 +777,18 @@ def _verify_log(
     require_current: bool = False,
     log_id: str | None = None,
     anchored_heads: Iterable[str] = (),
+    seed: _LogState | None = None,
 ) -> _LogState:
     """Record and head mismatches are collected into one error (head first); a structural failure raises at once.
     The first line's key is current until a rotation entry replaces it. `log_id` demands a matching genesis first.
-    Every anchored head must be the hash of a verified line."""
-    sealed: set[str] = set()
-    hashes: set[str] = set()
-    head: str | None = None
+    Every anchored head must be the hash of a verified line. A `seed` resumes after its lines: `log` holds the rest."""
+    seed = seed or _LogState(set(), None, None, frozenset(), set())
+    sealed: set[str] = set(seed.sealed)
+    hashes: set[str] = set(seed.hashes)
+    head, active, retired, seen_v2, genesis_id = seed.head, seed.active, seed.retired, seed.seen_v2, seed.log_id
     problems: list[str] = []
-    active: str | None = None
-    retired: frozenset[str] = frozenset()
-    seen_v2 = False
-    for number, manifest in enumerate(log):
+    lines = seed.lines
+    for number, manifest in enumerate(log, start=seed.lines):
         is_seal = "kind" not in manifest
         if manifest.get("kind") == _GENESIS_KIND:
             if number:
@@ -699,6 +797,7 @@ def _verify_log(
             if log_id is not None and manifest["log_id"] != log_id:
                 raise ManifestVerificationError(f"manifest log is for log_id {manifest['log_id']!r}, not {log_id!r}")
             active = manifest["signature"]["key_id"]
+            genesis_id = manifest["log_id"]
             where = "the genesis entry"
         elif log_id is not None and number == 0:
             raise ManifestVerificationError(f"manifest log line 1 is not a genesis entry for log_id {log_id!r}")
@@ -731,6 +830,7 @@ def _verify_log(
         head = manifest_hash(manifest)
         hashes.add(head)
         seen_v2 = seen_v2 or manifest["manifest_version"] == _MANIFEST_VERSION
+        lines = number + 1
     if require_current and active is not None and active != signer.key_id:
         raise ManifestVerificationError(f"manifest log is under key {active!r}, not the signer's {signer.key_id!r}")
     if expected_head is not None and head != expected_head:
@@ -743,7 +843,7 @@ def _verify_log(
         if len(problems) > _MAX_PROBLEMS:
             message += f"; and {len(problems) - _MAX_PROBLEMS} more"
         raise ManifestVerificationError(message)
-    return _LogState(sealed, head, active, retired, hashes)
+    return _LogState(sealed, head, active, retired, hashes, seen_v2, genesis_id, lines)
 
 
 class HeadAnchor(Protocol):
@@ -752,6 +852,38 @@ class HeadAnchor(Protocol):
     def write(self, head: str) -> None: ...
 
     def latest(self) -> str | None: ...
+
+
+_TAIL_CHUNK = 8 * 1024
+
+
+def _read_lines_reversed(file: IO[bytes]) -> Iterator[bytes | None]:
+    """Yield the lines of `file` last to first, reading bounded chunks and keeping at most MAX_LINE_BYTES bytes of
+    a line. The unterminated tail (if any) comes first without a newline; a line over the cap is yielded as None."""
+
+    def emit(segs: list[bytes], size: int, terminated: bool) -> bytes | None:
+        return None if size > MAX_LINE_BYTES else b"".join(reversed(segs)) + (b"\n" if terminated else b"")
+
+    pos = file.seek(0, os.SEEK_END)
+    segs: list[bytes] = []
+    size, tail = 0, True
+    while pos > 0:
+        step = min(_TAIL_CHUNK, pos)
+        pos -= step
+        file.seek(pos)
+        parts = file.read(step).split(b"\n")
+        for i in range(len(parts) - 1, -1, -1):
+            size += len(parts[i])
+            if size <= MAX_LINE_BYTES:
+                segs.append(parts[i])
+            else:
+                segs.clear()
+            if i:
+                if size or not tail:
+                    yield emit(segs, size, not tail)
+                segs, size, tail = [], 0, False
+    if size or not tail:
+        yield emit(segs, size, not tail)
 
 
 class NdjsonHeadAnchor:
@@ -765,25 +897,35 @@ class NdjsonHeadAnchor:
         _append_and_fsync(self._path, [{"head": head, "anchored_at": _utc_now()}])
 
     def latest(self) -> str | None:
-        """The last terminated line's head; None for a missing file or one without a terminated line. An unterminated
-        last line (crash residue) is ignored; a terminated bad line raises ManifestVerificationError."""
+        """The last terminated line's head; None for a missing file or one without a terminated line. An unterminated, torn
+        or oversized last line (crash residue) is ignored; a terminated bad line raises ManifestVerificationError."""
         try:
             with open(self._path, "rb") as file:
-                lines = list(file)
+                lines = list(islice(_read_lines_reversed(file), 2))
         except FileNotFoundError:
             return None
-        if lines and not lines[-1].endswith(b"\n"):
-            lines.pop()
+        if lines and (lines[0] is None or not lines[0].endswith(b"\n")):
+            lines.pop(0)
         if not lines:
             return None
-        head = _parse_ndjson_line(self._path, len(lines), lines[-1])[1].get("head")
+        raw = _OversizedLine() if lines[0] is None else lines[0]
+        head = _parse_ndjson_line(self._path, "last terminated line", raw)[1].get("head")
         if not isinstance(head, str):
-            raise ManifestVerificationError(f"{self._path} line {len(lines)} has no string head")
+            raise ManifestVerificationError(f"{self._path} last terminated line has no string head")
         return head
+
+
+def _check_line_cap(records: Sequence[Mapping[str, Any]]) -> None:
+    """Raise ValueError before anything is written if a record's line is longer than MAX_LINE_BYTES."""
+    for record in records:
+        size = len(_canonical_json(record))
+        if size > MAX_LINE_BYTES:
+            raise ValueError(f"a line of {size} bytes exceeds the {MAX_LINE_BYTES} byte line cap")
 
 
 def _append_and_fsync(path: str | Path, records: Sequence[Mapping[str, Any]]) -> None:
     """Append, then fsync the file and its parent directory."""
+    _check_line_cap(records)
     _append_records(path, records)
     _fsync(path)
     _fsync(Path(path).parent)
@@ -876,6 +1018,355 @@ def rotate_manifest_key(
         return entry
 
 
+_CHECKPOINT_KIND = "seal_checkpoint"
+_CHECKPOINT_INTS = ("st_dev", "st_ino", "end", "lines", "head_start")
+_AUDIT_INTS = ("audit_dev", "audit_ino", "audit_end", "audit_lines", "audit_last_start")
+_CHECKPOINT_KEYS = {
+    *_CHECKPOINT_INTS,
+    *_AUDIT_INTS,
+    "audit_last_sha256",
+    "audit_pending",
+    "kind",
+    "head",
+    "active",
+    "retired",
+    "log_id",
+    "seen_v2",
+    "signature",
+}
+_SQLITE_HEADER = b"SQLite format 3\x00"
+_sqlite_missing_logged = False
+
+
+def _sqlite() -> ModuleType | None:
+    """The sqlite3 module, or None (logged once) where it is missing: the index is then off."""
+    global _sqlite_missing_logged
+    try:
+        import sqlite3
+    except ImportError:
+        if not _sqlite_missing_logged:
+            _sqlite_missing_logged = True
+            logger.warning("seal_index_path is ignored: sqlite3 is not available")
+        return None
+    return sqlite3
+
+
+class _Scan:
+    """Walks manifest lines from `end`, tracking line numbers, the last line's start and each seal's start offset."""
+
+    def __init__(self, end: int = 0, count: int = 0, last: int | None = None) -> None:
+        self.end, self.count, self.last = end, count, last
+        self.seals: dict[str, int] = {}
+
+    def manifests(self, path: str | Path) -> Iterator[dict[str, Any]]:
+        try:
+            with open(path, "rb") as file:
+                file.seek(self.end)
+                for raw in _read_lines(file):
+                    self.count += 1
+                    manifest = _parse_ndjson_line(path, self.count, raw)[1]
+                    self.last = self.end
+                    if "kind" not in manifest and isinstance(manifest.get("run_id"), str):
+                        self.seals[manifest["run_id"]] = self.end
+                    self.end += len(raw)
+                    yield manifest
+        except FileNotFoundError:
+            return
+
+
+def _checkpoint_current(entry: Any, signer: ManifestSigner, manifest_path: str | Path) -> bool:
+    """True iff `entry` is a checkpoint signed by the current key that still describes the manifest file."""
+    if not isinstance(entry, dict) or set(entry) != _CHECKPOINT_KEYS or entry["kind"] != _CHECKPOINT_KIND:
+        return False
+    signature = entry["signature"]
+    if not isinstance(signature, Mapping) or set(signature) != _SIGNATURE_KEYS:
+        return False
+    value = signature["value"]
+    # Authenticate before trusting any field.
+    if not isinstance(value, str) or not signer.verify(_signing_payload(entry), value):
+        return False
+    if {signature["key_id"], entry["active"]} != {signer.key_id} or signature["algorithm"] != signer.algorithm:
+        return False
+    return _checkpoint_fresh(entry, manifest_path)
+
+
+def _checkpoint_fresh(entry: Any, manifest_path: str | Path) -> bool:
+    """True iff `entry` has the checkpoint shape and still describes the manifest file (signature not checked)."""
+    if not isinstance(entry, dict) or set(entry) != _CHECKPOINT_KEYS or entry["kind"] != _CHECKPOINT_KIND:
+        return False
+    shape = (
+        all(type(entry[key]) is int for key in _CHECKPOINT_INTS)
+        and isinstance(entry["head"], str)
+        and isinstance(entry["retired"], list)
+        and all(isinstance(key, str) for key in entry["retired"])
+        and (entry["log_id"] is None or isinstance(entry["log_id"], str))
+        and type(entry["seen_v2"]) is bool
+    )
+    start, end = entry["head_start"], entry["end"]
+    if not shape or not 0 <= start < end <= start + MAX_LINE_BYTES + 1:
+        return False
+    stat_result = os.stat(manifest_path)
+    if (stat_result.st_dev, stat_result.st_ino) != (entry["st_dev"], entry["st_ino"]) or stat_result.st_size < end:
+        return False
+    with open(manifest_path, "rb") as file:
+        file.seek(start)
+        raw = file.read(end - start)
+    try:
+        return raw.endswith(b"\n") and manifest_hash(_decode_line("seal index head line", raw[:-1])) == entry["head"]
+    except ManifestVerificationError:
+        return False
+
+
+def _load_checkpoint(
+    index_path: str | Path, manifest_path: str | Path, run_id: str, signer: ManifestSigner
+) -> tuple[dict[str, Any], int | None] | None:
+    """The valid checkpoint and the run's hinted seal offset, or None for anything missing, unreadable or stale."""
+    db = _sqlite()
+    if db is None or not os.path.exists(index_path):
+        return None
+    try:
+        entry, hint = _read_index(db, index_path, run_id)
+        if not _checkpoint_current(entry, signer, manifest_path):
+            return None
+    except Exception:  # an untrusted index must never fail the seal: any error means a full verify
+        return None
+    return entry, hint
+
+
+def _read_index(db: ModuleType, index_path: str | Path, run_id: str) -> tuple[Any, int | None]:
+    """The stored checkpoint entry and the run's hinted offset, read-only and without waiting on a writer."""
+    with closing(db.connect(Path(index_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=0)) as conn:
+        conn.execute("PRAGMA trusted_schema=OFF")
+        row = conn.execute(
+            "SELECT body FROM checkpoint WHERE id = 1 AND length(CAST(body AS BLOB)) <= ?", (MAX_LINE_BYTES,)
+        ).fetchone()
+        hint = conn.execute("SELECT line_start FROM hint WHERE run_id = ?", (run_id,)).fetchone()
+    if row is None or not isinstance(row[0], str):
+        raise ValueError("seal index checkpoint is missing, oversized or not text")
+    entry = _decode_line("seal index checkpoint", row[0].encode("utf-8"))
+    return entry, None if hint is None else hint[0]
+
+
+def _indexed_lookup(manifest_path: str | Path, run_id: str, index_path: str | Path) -> bool | None:
+    """Whether the index says run_id is sealed, or None when it cannot be trusted (caller scans everything)."""
+    db = _sqlite()
+    if db is None or not os.path.exists(index_path):
+        return None
+    try:
+        entry, hint = _read_index(db, index_path, run_id)
+        if not _checkpoint_fresh(entry, manifest_path):
+            return None
+        if hint is not None:
+            return True if _hint_names_run(manifest_path, hint, run_id) else None
+        return _scan_for_run(manifest_path, run_id, entry["end"])
+    except Exception:  # an untrusted index must never fail the calculation: any error means a full scan
+        return None
+
+
+def _audit_scan_from(entry: Mapping[str, Any], audit_path: str | Path) -> _AuditScan | None:
+    """The audit scan a checkpoint recorded, or None when the audit file no longer matches it."""
+    try:
+        dev, ino, end, count, last = (entry[key] for key in _AUDIT_INTS)
+        sha, pending = entry["audit_last_sha256"], entry["audit_pending"]
+        if not all(type(value) is int for value in (dev, ino, end, count, last)) or not isinstance(sha, str):
+            return None
+        first = {run: (offset, number) for run, (offset, number) in pending.items()}
+        stat_result = os.stat(audit_path)
+        if (stat_result.st_dev, stat_result.st_ino) != (dev, ino) or stat_result.st_size < end:
+            return None
+        if end:
+            if not 0 <= last < end <= last + MAX_LINE_BYTES + 1:
+                return None
+            with open(audit_path, "rb") as file:
+                file.seek(last)
+                if _sha256(file.read(end - last)) != sha:
+                    return None
+    except (OSError, KeyError, TypeError, ValueError, AttributeError):
+        return None
+    scan = _AuditScan(dev, ino)
+    scan.end, scan.count, scan.last_start, scan.last_sha256, scan.first = end, count, last, sha, first
+    return scan
+
+
+def _scan_audit_tail(audit_path: str | Path, scan: _AuditScan, sealed: Container[str]) -> None:
+    """Advance `scan` over the terminated audit lines after it, noting where unsealed runs start."""
+    for line, record in _read_ndjson(audit_path, scan.end, scan.count + 1):
+        scan.note(line, _record_run_id(record), sealed)
+
+
+def _hint_names_run(manifest_path: str | Path, offset: object, run_id: str) -> bool:
+    """True iff the manifest line at `offset` is a seal of `run_id`."""
+    if type(offset) is not int:
+        return False
+    with open(manifest_path, "rb") as file:
+        file.seek(offset)
+        raw = next(_read_lines(file), b"")
+    try:
+        line = _decode_line("seal index hint", raw.rstrip(b"\n")) if raw.endswith(b"\n") else None
+    except ManifestVerificationError:
+        return False
+    return isinstance(line, dict) and "kind" not in line and line.get("run_id") == run_id
+
+
+def _is_sqlite_or_empty(path: str | Path) -> bool:
+    with open(path, "rb") as file:
+        head = file.read(len(_SQLITE_HEADER))
+    return not head or head == _SQLITE_HEADER
+
+
+def _store_checkpoint(
+    index_path: str | Path, entry: dict[str, Any], hints: Mapping[str, int], *, rebuild: bool
+) -> None:
+    """Commit `entry` and `hints` (all hints replaced if `rebuild`); a corrupt SQLite file is deleted and recreated,
+    any other file is left alone and raises."""
+    db = _sqlite()
+    if db is None:
+        return
+    body = _canonical_json(entry).decode("utf-8")
+    for attempt in (0, 1):
+        try:
+            if not os.path.exists(index_path):
+                os.close(os.open(index_path, os.O_WRONLY | os.O_CREAT, 0o600))
+            with closing(db.connect(os.fspath(index_path), timeout=5)) as conn:
+                conn.execute("PRAGMA trusted_schema=OFF")
+                conn.execute("PRAGMA journal_mode=DELETE")
+                conn.execute("CREATE TABLE IF NOT EXISTS checkpoint (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+                conn.execute("CREATE TABLE IF NOT EXISTS hint (run_id TEXT PRIMARY KEY, line_start INTEGER NOT NULL)")
+                with conn:
+                    if rebuild:
+                        conn.execute("DELETE FROM hint")
+                    conn.executemany("INSERT OR REPLACE INTO hint VALUES (?, ?)", list(hints.items()))
+                    conn.execute("INSERT OR REPLACE INTO checkpoint VALUES (1, ?)", (body,))
+            return
+        except db.OperationalError:
+            raise
+        except db.DatabaseError:
+            if attempt:
+                raise
+            if not _is_sqlite_or_empty(index_path):
+                raise ValueError(f"{index_path} is not a SQLite file; leaving it alone") from None
+            os.unlink(index_path)
+
+
+def _checkpoint_entry(
+    manifest_path: str | Path,
+    state: _LogState,
+    head_start: int,
+    signer: ManifestSigner,
+    audit: _AuditScan,
+    done: Container[str],
+) -> dict[str, Any]:
+    stat_result = os.stat(manifest_path)
+    entry: dict[str, Any] = {
+        "kind": _CHECKPOINT_KIND,
+        "st_dev": stat_result.st_dev,
+        "st_ino": stat_result.st_ino,
+        "end": stat_result.st_size,
+        "lines": state.lines,
+        "head_start": head_start,
+        "head": state.head,
+        "active": state.active,
+        "retired": sorted(state.retired),
+        "log_id": state.log_id,
+        "seen_v2": state.seen_v2,
+        "audit_dev": audit.dev,
+        "audit_ino": audit.ino,
+        "audit_end": audit.end,
+        "audit_lines": audit.count,
+        "audit_last_start": audit.last_start,
+        "audit_last_sha256": audit.last_sha256,
+        "audit_pending": {run: list(where) for run, where in audit.first.items() if run not in done},
+    }
+    entry["signature"] = _signature_block(entry, signer)
+    return entry
+
+
+def _verify_from_checkpoint(
+    index_path: str | Path,
+    manifest_path: str | Path,
+    run_id: str,
+    *,
+    signer: ManifestSigner,
+    signers: Mapping[str, ManifestSigner],
+    expected_head: str | None,
+    log_id: str | None,
+    anchors: Sequence[str],
+) -> tuple[_LogState, _Scan, dict[str, Any]] | None:
+    """Verify only the manifest lines after a valid checkpoint; None means verify the whole log."""
+    loaded = _load_checkpoint(index_path, manifest_path, run_id, signer)
+    if loaded is None:
+        return None
+    checkpoint, hint = loaded
+    scan = _Scan(checkpoint["end"], checkpoint["lines"], checkpoint["head_start"])
+    head = checkpoint["head"]
+    seed = _LogState(
+        set(),
+        head,
+        checkpoint["active"],
+        frozenset(checkpoint["retired"]),
+        {head},
+        checkpoint["seen_v2"],
+        checkpoint["log_id"],
+        checkpoint["lines"],
+    )
+    state = _verify_log(
+        scan.manifests(manifest_path),
+        signer=signer,
+        signers=signers,
+        expected_head=expected_head,
+        require_current=True,
+        log_id=log_id,
+        seed=seed,
+    )
+    if log_id is not None and state.log_id != log_id:
+        return None
+    if _unverified_anchor(anchors, state.hashes) is not None:
+        logger.info("seal index skipped: an anchored head is older than the checkpoint")
+        return None
+    if hint is not None:
+        if not _hint_names_run(manifest_path, hint, run_id):
+            return None
+        state.sealed.add(run_id)
+    return state, scan, checkpoint
+
+
+def _update_index(
+    index_path: str | Path,
+    manifest_path: str | Path,
+    state: _LogState,
+    scan: _Scan,
+    audit: _AuditScan,
+    appended: Sequence[Mapping[str, Any]],
+    signer: ManifestSigner,
+    *,
+    rebuild: bool,
+) -> None:
+    """Commit a fresh checkpoint and the new seals' hints after an append; a failure is logged, never raised."""
+    try:
+        offset = os.path.getsize(manifest_path) - sum(len(_canonical_json(entry)) + 1 for entry in appended)
+        hints, head_start = dict(scan.seals), scan.last
+        for entry in appended:
+            head_start = offset
+            if "kind" not in entry:
+                hints[entry["run_id"]] = offset
+            offset += len(_canonical_json(entry)) + 1
+        genesis = next((entry["log_id"] for entry in appended if entry.get("kind") == _GENESIS_KIND), state.log_id)
+        head = manifest_hash(appended[-1]) if appended else state.head
+        after = replace(
+            state,
+            head=head,
+            active=state.active or signer.key_id,
+            seen_v2=state.seen_v2 or bool(appended),
+            log_id=genesis,
+            lines=state.lines + len(appended),
+        )
+        done = state.sealed | {entry["run_id"] for entry in appended if "kind" not in entry}
+        entry = _checkpoint_entry(manifest_path, after, head_start or 0, signer, audit, done)
+        _store_checkpoint(index_path, entry, hints, rebuild=rebuild)
+    except Exception as exc:
+        logger.warning("seal index %s was not updated: %s", index_path, exc)
+
+
 def seal_ndjson_runs(
     audit_path: str | Path,
     manifest_path: str | Path,
@@ -889,6 +1380,7 @@ def seal_ndjson_runs(
     anchored_heads: Iterable[str] = (),
     head_anchor: HeadAnchor | None = None,
     older_than: timedelta | None = None,
+    seal_index_path: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     """Seal every unsealed run (or only `run_id`). Seal only after a run's writers stop, or sealing a still-live run
     fails its verification for good; prefer AuditExtender's automatic sealing from Extender.on_run_complete when
@@ -906,9 +1398,23 @@ def seal_ndjson_runs(
     lock (its failure leaves the seals written).
     `older_than` (a non-negative timedelta, not with `run_id`) is the manual stale sweep for crashed runs: it seals only
     runs whose newest record `event_time` is older than now minus it. A run with a record lacking a parseable
-    `event_time` is skipped, and one warning gives the count."""
+    `event_time` is skipped, and one warning gives the count.
+    `seal_index_path` (opt-in sqlite file) keeps a signed checkpoint of the verified log, so a `run_id` seal verifies
+    only the manifest lines after it; any stale or unusable index means full verification, and an index error after
+    the append is logged, never raised."""
     signers = _signer_map(signer, previous_signers)
     _reject_aliased_paths(audit_path=audit_path, manifest_path=manifest_path)
+    if seal_index_path is not None:
+        anchor_path = head_anchor._path if isinstance(head_anchor, NdjsonHeadAnchor) else None
+        _reject_aliased_paths(
+            audit_path=audit_path,
+            manifest_path=manifest_path,
+            seal_index_path=seal_index_path,
+            **({"head_anchor": anchor_path} if anchor_path is not None else {}),
+        )
+        if _sqlite() is None:
+            seal_index_path = None
+    anchors = list(anchored_heads)
     if run_id is not None and (not isinstance(run_id, str) or _is_blank(run_id)):
         raise ValueError("seal_ndjson_runs run_id must be a non-blank string")
     if older_than is not None:
@@ -917,16 +1423,39 @@ def seal_ndjson_runs(
         if run_id is not None:
             raise ValueError("seal_ndjson_runs older_than cannot be combined with run_id")
     _check_log_id("seal_ndjson_runs", log_id)
+    existed = os.path.exists(manifest_path)
     with _flock(manifest_path, exclusive=True):
-        state = _verify_log(
-            _iter_manifests(manifest_path),
-            signer=signer,
-            signers=signers,
-            expected_head=expected_head,
-            require_current=True,
-            log_id=log_id,
-            anchored_heads=anchored_heads,
-        )
+        fast = checkpoint = None
+        if seal_index_path is not None and run_id is not None:
+            fast = _verify_from_checkpoint(
+                seal_index_path,
+                manifest_path,
+                run_id,
+                signer=signer,
+                signers=signers,
+                expected_head=expected_head,
+                log_id=log_id,
+                anchors=anchors,
+            )
+        state, scan = (fast[0], fast[1]) if fast else (None, _Scan())
+        audit = None
+        if fast:
+            checkpoint = fast[2]
+            audit = _audit_scan_from(checkpoint, audit_path)
+            if audit is None:
+                # The audit cursor cannot resume, so rebuild everything instead of carrying sealed runs as pending.
+                fast = checkpoint = state = None
+                scan = _Scan()
+        if state is None:
+            state = _verify_log(
+                scan.manifests(manifest_path),
+                signer=signer,
+                signers=signers,
+                expected_head=expected_head,
+                require_current=True,
+                log_id=log_id,
+                anchored_heads=anchors,
+            )
         sealed, head = state.sealed, state.head
         if run_id is not None and run_id in sealed:
             raise RunAlreadySealedError(f"run_id {run_id!r} is already sealed in {manifest_path}")
@@ -934,10 +1463,20 @@ def seal_ndjson_runs(
         # to raise, as before.
         with suppress(FileNotFoundError):
             _fsync(audit_path)
+        incremental = audit is not None and run_id is not None
+        first = (0, 1)
+        if audit is not None and incremental:
+            _scan_audit_tail(audit_path, audit, sealed)
+            first = audit.first.get(run_id, (audit.end, audit.count + 1)) if run_id else first
+        else:
+            audit = _AuditScan.fresh(audit_path) if seal_index_path is not None else None
         digests = _digest_runs(
             audit_path,
             lambda candidate: candidate == run_id if run_id is not None else candidate not in sealed,
             track_times=older_than is not None,
+            start=first[0],
+            number=first[1],
+            scan=None if incremental else audit,
         )
         if older_than is not None:
             digests = _stale_runs(digests, older_than)
@@ -955,7 +1494,16 @@ def seal_ndjson_runs(
             manifests.append(manifest)
             head = manifest_hash(manifest)
         appended = [*genesis, *manifests]
+        try:
+            _check_line_cap(appended)
+        except ValueError:
+            if not existed and os.path.getsize(manifest_path) == 0:
+                with suppress(OSError):
+                    _unlink_durably(manifest_path)
+            raise
         _append_with_rollback(manifest_path, appended, existed=True)
+        if seal_index_path is not None and audit is not None and (appended or (not fast and state.head is not None)):
+            _update_index(seal_index_path, manifest_path, state, scan, audit, appended, signer, rebuild=not fast)
         if head_anchor is not None and appended:
             head_anchor.write(manifest_hash(appended[-1]))
         return manifests
@@ -1083,11 +1631,14 @@ _Damage = list[_DamageEntry]
 
 
 def _damage_entry(file: str, path: str | Path, number: int, offset: int, raw: bytes, reason: str) -> _DamageEntry:
-    return QuarantinedLine(file, number, offset, len(raw), _sha256(raw), reason), raw, Path(path)
+    digest = raw.sha256 if isinstance(raw, _OversizedLine) else _sha256(raw)
+    return QuarantinedLine(file, number, offset, _line_size(raw), digest, reason), raw, Path(path)
 
 
 def _refuse_json_tail(path: str | Path, number: int, tail: bytes) -> None:
     where = f"{path} line {number}"
+    if isinstance(tail, _OversizedLine):
+        return
     try:
         _decode_line(where, tail)
     except ManifestVerificationError:
@@ -1101,18 +1652,18 @@ def _damaged_lines(file: str, path: str | Path, raws: Iterable[bytes], *, number
         try:
             _parse_ndjson_line(path, number, raw)
         except ManifestVerificationError as exc:
-            if not raw.endswith(b"\n"):
+            if not _is_terminated(raw):
                 _refuse_json_tail(path, number, raw)
             damage.append(_damage_entry(file, path, number, offset, raw, str(exc)))
         number += 1
-        offset += len(raw)
+        offset += _line_size(raw)
     return damage
 
 
 def _damaged_audit_lines(path: str | Path) -> _Damage:
     try:
         with open(path, "rb") as file:
-            return _damaged_lines("audit", path, file)
+            return _damaged_lines("audit", path, _read_lines(file))
     except FileNotFoundError:
         return []
 
@@ -1121,10 +1672,10 @@ def _split_unterminated_tail(path: str | Path) -> tuple[list[bytes], bytes]:
     """The terminated raw lines of `path` (none if it is missing), and its unterminated last line (empty if none)."""
     try:
         with open(path, "rb") as file:
-            lines = list(file)
+            lines = list(_read_lines(file))
     except FileNotFoundError:
         lines = []
-    tail = lines.pop() if lines and not lines[-1].endswith(b"\n") else b""
+    tail = lines.pop() if lines and not _is_terminated(lines[-1]) else b""
     return lines, tail
 
 
@@ -1148,7 +1699,7 @@ def _damaged_manifest_tail(
         )
     if not tail:
         return []
-    return _damaged_lines("manifest", path, [tail], number=len(lines) + 1, offset=sum(map(len, lines)))
+    return _damaged_lines("manifest", path, [tail], number=len(lines) + 1, offset=sum(map(_line_size, lines)))
 
 
 def _trace_entry(
@@ -1159,10 +1710,14 @@ def _trace_entry(
         "quarantined_at": _utc_now(),
         **asdict(item),
         "path": str(path),
-        "raw_base64": base64.b64encode(raw).decode("ascii"),
+        "raw_base64": None if isinstance(raw, _OversizedLine) else base64.b64encode(raw).decode("ascii"),
         "previous_entry_hash": previous_entry_hash,
     }
     entry["signature"] = _signature_block(entry, signer)
+    if entry["raw_base64"] is not None and len(_canonical_json(entry)) > MAX_LINE_BYTES:
+        # Only the sha256 and length stay when the encoded bytes would push the trace line over the cap.
+        entry["raw_base64"] = None
+        entry["signature"] = _signature_block(entry, signer)
     return entry
 
 
@@ -1303,7 +1858,12 @@ def _rewrite_without(path: str | Path, drop: set[int]) -> None:
     fd, temp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
     try:
         with os.fdopen(fd, "wb") as out, open(target, "rb") as source:
-            out.writelines(raw for number, raw in enumerate(source, start=1) if number not in drop)
+            for number, raw in enumerate(_read_lines(source), start=1):
+                if number in drop:
+                    continue
+                if isinstance(raw, _OversizedLine):
+                    raise ValueError(f"{path} line {number} is longer than {MAX_LINE_BYTES} bytes and cannot be kept")
+                out.write(raw)
             out.flush()
             os.fsync(out.fileno())
         os.chmod(temp, stat.S_IMODE(os.stat(target).st_mode))
@@ -1434,7 +1994,7 @@ def quarantine_from_rotation_entry(
         dropped = [*lines[len(prefix) :], *([tail] if tail else [])]
         if not dropped:
             return []
-        number, offset = len(prefix) + 1, sum(map(len, lines[: len(prefix)]))
+        number, offset = len(prefix) + 1, sum(map(_line_size, lines[: len(prefix)]))
         # Parsing refuses an unterminated first line; later lines, even a valid-JSON tail, are dropped unread.
         if "kind" not in _parse_ndjson_line(manifest_path, number, dropped[0])[1]:
             raise ManifestVerificationError(f"{manifest_path} line {number} is not a key rotation entry")
@@ -1443,7 +2003,7 @@ def quarantine_from_rotation_entry(
         for raw in dropped:
             damage.append(_damage_entry("manifest", manifest_path, number, offset, raw, reason))
             number += 1
-            offset += len(raw)
+            offset += _line_size(raw)
         _trace_damage(
             damage,
             quarantine_path=quarantine_path,

@@ -22,6 +22,7 @@ from mloda.enterprise.extenders.audit.run_manifest import (
     ManifestVerificationError,
     RunAlreadySealedError,
     RunNotPendingError,
+    _check_line_cap,
     _check_log_id,
     _check_run_against_seal,
     _reject_aliased_paths,
@@ -80,6 +81,7 @@ class NdjsonAuditSink:
         self.path = Path(path)
 
     def write(self, record: Mapping[str, Any]) -> None:
+        _check_line_cap([record])
         _append_records(self.path, [record])
 
 
@@ -166,7 +168,8 @@ class AuditExtender(Extender):
     emitted to it, and its latest head must still be in the log). A seal failure (any sealing or anchor error, or a
     mismatch with an existing seal) increments the public seal_failures counter and follows seal_failure_policy:
     "log" (default), "raise", or a callable(run_id, exc). Core contains an exception raised from on_run_complete,
-    so "raise" does not fail the finished run."""
+    so "raise" does not fail the finished run. seal_index_path opts into a rebuildable seal index cache; it needs the
+    sealing config and must not alias audit_path, manifest_path or the anchor path."""
 
     def __init__(
         self,
@@ -182,6 +185,7 @@ class AuditExtender(Extender):
         log_id: str | None = None,
         head_anchor: HeadAnchor | None = None,
         seal_failure_policy: Literal["log", "raise"] | Callable[[str, BaseException], None] = "log",
+        seal_index_path: str | Path | None = None,
     ) -> None:
         unknown = [name for name in required_identity if name not in _ALLOWED_IDENTITY_NAMES]
         if unknown:
@@ -223,9 +227,14 @@ class AuditExtender(Extender):
                 )
             if previous_signers:
                 raise ValueError("AuditExtender previous_signers needs a signer, else there is nothing to seal with")
-            if log_id is not None or head_anchor is not None or seal_failure_policy != "log":
+            if (
+                log_id is not None
+                or head_anchor is not None
+                or seal_failure_policy != "log"
+                or seal_index_path is not None
+            ):
                 raise ValueError(
-                    "AuditExtender log_id, head_anchor and seal_failure_policy need the sealing config "
+                    "AuditExtender log_id, head_anchor, seal_failure_policy and seal_index_path need the sealing config "
                     "(audit_path, manifest_path and signer), else there is nothing to seal"
                 )
         elif audit_path is None or manifest_path is None:
@@ -241,6 +250,14 @@ class AuditExtender(Extender):
             _reject_aliased_paths(audit_path=audit_path, manifest_path=manifest_path)
             _signer_map(signer, previous_signers)
             _check_log_id("AuditExtender", log_id)
+            if seal_index_path is not None:
+                anchor_path = getattr(head_anchor, "_path", None)
+                _reject_aliased_paths(
+                    audit_path=audit_path,
+                    manifest_path=manifest_path,
+                    seal_index_path=seal_index_path,
+                    **({"head_anchor": anchor_path} if anchor_path is not None else {}),
+                )
         self.sink = sink
         self.required_identity = required_identity
         self.raise_on_error = raise_on_error
@@ -255,6 +272,7 @@ class AuditExtender(Extender):
         self._log_id = log_id
         self._head_anchor = head_anchor
         self._seal_failure_policy = seal_failure_policy
+        self._seal_index_path = seal_index_path
         self.seal_failures = 0
         self._pickle_drop_warning = WarnOncePerInstance()
         self._run_sealed: dict[str, bool] = {}
@@ -329,6 +347,7 @@ class AuditExtender(Extender):
                 log_id=self._log_id,
                 head_anchor=self._head_anchor,
                 anchored_heads=anchors,
+                seal_index_path=self._seal_index_path,
             )
         except RunAlreadySealedError:
             try:
@@ -483,7 +502,7 @@ class AuditExtender(Extender):
         if run_id in self._run_sealed:
             return self._run_sealed[run_id]
         try:
-            found = _is_run_sealed_unverified(self._manifest_path, run_id)
+            found = _is_run_sealed_unverified(self._manifest_path, run_id, self._seal_index_path)
         except OSError as exc:
             logger.warning(
                 "AuditExtender: could not read manifest_path %s for run_id %r (%s); calculations under it "
