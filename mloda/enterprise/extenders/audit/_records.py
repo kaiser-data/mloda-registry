@@ -15,9 +15,19 @@ def _is_blank(value: str | None) -> bool:
     return value is None or not value.strip()
 
 
+def _parse_event_time(event_time: object) -> datetime:
+    """A record's event_time as an aware UTC datetime; ValueError if unparseable. removesuffix: 3.10 rejects a Z."""
+    if not isinstance(event_time, str):
+        raise ValueError(f"event_time {event_time!r} is not a string")
+    parsed = datetime.fromisoformat(event_time.removesuffix("Z"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _canonical_json(record: Mapping[str, Any]) -> bytes:
     """The bytes NdjsonAuditSink writes for a record, without the newline."""
-    return json.dumps(record, sort_keys=True).encode("utf-8")
+    return json.dumps(record, sort_keys=True, allow_nan=False).encode("utf-8")
 
 
 def _utc_now() -> str:
