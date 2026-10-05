@@ -104,7 +104,7 @@ marker) is a patch release, which `~=` admits. A PR that changes the seam tables
 
 Public names need no bound: `mloda-enterprise` keeps `"mloda-community-extenders-shared>={version}"`
 because its runtime code uses only public names from it and subclasses none of its classes
-(`tests/test_end2end/test_dependency_direction.py` guards this). A `~=` there would also cap the `mloda-community` bundle, which pins that package exactly.
+(`tests/test_end2end/test_dependency_direction.py` guards this). A `~=` there would also cap the `mloda-community` bundle, which pins that package exactly. Subclassing a class built for it (`BinaryModelMixin`, through its public ClassVars and `run_binary_model`) counts as public use, so `mloda-community-binary-model` is also a `>=` floor.
 
 Naming a nested sibling in an `entry_point_bundle`'s own `dependencies` or a non-dev extra owns that
 sibling: the bundle excludes its code from its own wheel, since the sibling's own distribution ships
@@ -159,12 +159,11 @@ does not remove a dependency's dependencies; their entry points still register.
 
 ```text
 mloda-community (bundled)
-  └── ships: mloda.community
-        └── feature_groups/binary_model   (the only nested package left in the wheel)
+  └── ships: mloda.community   (no nested package; only the namespace's own files)
 
-every other feature group and every extender is owned by its own published
-distribution (example, example-a, data_operations and its plugin leaves, extenders shared,
-otel and openlineage, ...) and excluded from the wheel
+every feature group and every extender is owned by its own published
+distribution (example, example-a, binary-model, data_operations and its plugin leaves,
+extenders shared, otel and openlineage, ...) and excluded from the wheel
 ```
 
 A bundled plugin whose runtime dependency is heavy sits behind a bundle extra instead of a
@@ -218,6 +217,7 @@ py_typed = true
 | `pip install mloda-enterprise[otel]` | The bundle plus the OTel audit log sink's dependency |
 | `pip install mloda-enterprise[openlineage]` | The bundle plus the OpenLineage emitter the lineage facets extender builds on |
 | `pip install mloda-enterprise[anonymizer]` | The bundle plus the anonymizer wheel (`mloda-anonymizer-binary`) and pyarrow |
+| `pip install mloda-community-binary-model` | The binary-model mixin only, the base for binary-backed FeatureGroups |
 | `pip install mloda-community-example` | Base example only |
 | `pip install mloda-community-example[all]` | Base + its published variants |
 | `pip install mloda-community-example-a` | Variant A + base |

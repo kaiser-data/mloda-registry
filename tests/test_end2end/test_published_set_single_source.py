@@ -46,11 +46,12 @@ _BUNDLES = ["mloda-registry", "mloda-testing", "mloda-community", "mloda-enterpr
 # The released set, in config order: registry, the shared extenders package, the examples, the otel and
 # openlineage extenders, the data-operations base plus its plugin packages, the two bundles, which own
 # (dependencies/extras) every published package nested under their path, and finally testing, whose
-# binary-model extra pins mloda-community, so the published order is dependency-first.
+# binary-model extra pins the mloda-community-binary-model package.
 _EXPECTED_PUBLISHED = [
     "mloda-registry",
     "mloda-community-extenders-shared",
     "mloda-community-example",
+    "mloda-community-binary-model",
     "mloda-community-example-a",
     "mloda-community-otel",
     "mloda-community-openlineage",
@@ -79,7 +80,6 @@ _EXPECTED_PUBLISHED = [
 
 # Every unpublished package, which reaches users only inside the community and enterprise bundle wheels.
 _BUNDLE_ONLY = [
-    "mloda-community-binary-model",
     "mloda-enterprise-binary-example",
     "mloda-enterprise-anonymizer",
     "mloda-enterprise-audit",
@@ -409,6 +409,44 @@ def test_published_set_contains_the_bundles() -> None:
     assert set(_BUNDLES) <= set(flagged), (
         f"config/packages.toml does not flag bundles {sorted(set(_BUNDLES) - set(flagged))} as 'published = true'"
     )
+
+
+_MEMBER_MODULE = "mloda.community.feature_groups.binary_model"
+
+
+@pytest.mark.parametrize(
+    ("stderr", "accepted"),
+    [
+        ("ModuleNotFoundError: No module named 'mloda.community'", True),
+        (f"ModuleNotFoundError: No module named '{_MEMBER_MODULE}'", True),
+        ("ModuleNotFoundError: No module named 'pyarrow'", False),
+        (f"ModuleNotFoundError: No module named '{_MEMBER_MODULE}_x'", False),
+        ("ModuleNotFoundError: No module named 'mloda.comm'", False),
+    ],
+)
+def test_install_and_probe_accepts_a_gated_member_only_when_it_or_a_parent_package_is_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stderr: str, accepted: bool
+) -> None:
+    """A bare install lacking the member's parent package (No module named 'mloda.community') proves the member
+    is not installed; an unrelated or lookalike module name does not."""
+    monkeypatch.syspath_prepend(str(_EXTRAS_SCRIPT.parent))
+    extras = load_script("verify_extras", _EXTRAS_SCRIPT)
+
+    def fake_run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        is_member_import = command[-1] == f"import {_MEMBER_MODULE}"
+        return subprocess.CompletedProcess(
+            command, 1 if is_member_import else 0, "", stderr if is_member_import else ""
+        )
+
+    monkeypatch.setattr(extras.subprocess, "run", fake_run)
+
+    messages, errors = extras._install_and_probe(
+        "mloda-testing==9.9.9", (), False, {"mloda-community-binary-model": _MEMBER_MODULE}, str(tmp_path)
+    )
+
+    assert (errors == []) is accepted, f"stderr {stderr!r}: expected accepted={accepted}, got errors {errors!r}"
+    if accepted:
+        assert messages == ["  \u2713 mloda-community-binary-model: correctly not installed"], messages
 
 
 def test_published_flag_marks_exactly_the_released_distributions() -> None:
@@ -970,7 +1008,7 @@ def test_internal_extra_members_yields_exactly_the_internal_extras() -> None:
         ("mloda-community", "openlineage", ["mloda-community-openlineage"]),
         ("mloda-community", "all", ["mloda-community-otel", "mloda-community-openlineage"]),
         ("mloda-enterprise", "openlineage", ["mloda-community-openlineage"]),
-        ("mloda-testing", "binary-model", ["mloda-community"]),
+        ("mloda-testing", "binary-model", ["mloda-community-binary-model"]),
     ]
     assert entries == expected, f"internal_extra_members() yielded {entries!r}, expected exactly {expected!r}"
 
@@ -1032,8 +1070,8 @@ def test_verification_jobs_yields_one_bare_job_per_package_then_its_gated_jobs()
         ),
         ("mloda-enterprise", "mloda-enterprise==9.9.9", False, ["mloda-community-openlineage"]),
         ("mloda-enterprise", "mloda-enterprise[openlineage]==9.9.9", True, ["mloda-community-openlineage"]),
-        ("mloda-testing", "mloda-testing==9.9.9", False, ["mloda-community"]),
-        ("mloda-testing", "mloda-testing[binary-model]==9.9.9", True, ["mloda-community"]),
+        ("mloda-testing", "mloda-testing==9.9.9", False, ["mloda-community-binary-model"]),
+        ("mloda-testing", "mloda-testing[binary-model]==9.9.9", True, ["mloda-community-binary-model"]),
     ]
     assert jobs == expected, f"verification_jobs() yielded {jobs!r}, expected exactly {expected!r}"
 
@@ -1442,8 +1480,8 @@ def _bundle_dependency_names(bundle: str, packages: dict[str, dict[str, Any]]) -
     return named
 
 
-@pytest.mark.parametrize("bundle", _ENTRY_POINT_BUNDLES)
-def test_bundle_wheel_still_ships_every_nested_package(bundle: str) -> None:
+@pytest.mark.parametrize(("bundle", "has_unowned_nested"), [("mloda-community", False), ("mloda-enterprise", True)])
+def test_bundle_wheel_still_ships_every_nested_package(bundle: str, has_unowned_nested: bool) -> None:
     """Bundles ship all nested code, published or not, except a nested package the bundle owns through its
     own dependencies or a non-dev extra."""
     packages = _packages()
@@ -1454,9 +1492,19 @@ def test_bundle_wheel_still_ships_every_nested_package(bundle: str) -> None:
         for name, cfg in packages.items()
         if cfg["path"].startswith(prefix) and name not in owned
     }
-    assert nested, f"fixture assumption: {bundle} has configured packages nested under {prefix}"
+    assert bool(nested) == has_unowned_nested, (
+        f"fixture assumption: {bundle} should {'' if has_unowned_nested else 'not '}have configured packages "
+        f"nested under {prefix} that it does not own, got {sorted(nested)}"
+    )
 
     listed = _wheel_packages(bundle, packages)
+    if not has_unowned_nested:
+        # The bundle owns every nested package: its wheel ships only its own root, typed.
+        root = packages[bundle]["path"].replace("/", ".")
+        data = _generated(bundle, packages)["tool"]["setuptools"]["package-data"]
+        assert listed == [root], f"the {bundle} wheel owns every nested package, so it must ship only {root}: {listed}"
+        assert data == {root: ["py.typed"]}, f"the {bundle} wheel must ship the py.typed of {root}: {data}"
+        return
 
     missing = sorted(name for name, dotted in nested.items() if dotted not in listed)
     assert missing == [], (
