@@ -28,7 +28,7 @@ from mloda.steward import (
 from mloda.community.extenders.shared.open_invocations import OpenInvocationStack
 from mloda.community.extenders.shared.step_run_id import owner_name as owner_name
 from mloda.community.extenders.shared.step_run_id import step_run_id
-from mloda.community.extenders.shared.teardown import CLOSE_TIMEOUT
+from mloda.community.extenders.shared.teardown import CLOSE_TIMEOUT, capped_close_timeout
 from openlineage.client.client import OpenLineageClient
 from openlineage.client.event_v2 import InputDataset, Job, OutputDataset, Run, RunEvent, RunState
 from openlineage.client.facet_v2 import datasource_dataset, parent_run, schema_dataset
@@ -129,19 +129,19 @@ class OpenLineageExtender(Extender):
     """Emits one OpenLineage START/COMPLETE|FAIL|ABORT RunEvent per calculate invocation, correlating nested
     INPUT_DATA_LOAD calls and the calculate context's input features as inputs. Sink resolution: injected client wins,
     else use_sdk_defaults, else inert. Emits happen synchronously on the calculation thread, so a blocking transport
-    delays every wrapped calculation. close() flushes the client, capped at close_timeout (default 1s), and is
-    terminal. A self-built client is rebuilt per worker; an injected client that can't survive pickling is dropped
-    by a trial-pickle probe and falls back to the resolution rule above, while a picklable injected client is
-    pickled as-is. Core calls close() with no args on graceful MULTIPROCESSING worker exit; raise close_timeout
-    together with graceful_shutdown_timeout for a buffered transport (e.g. async_http, kafka) to fully drain,
-    otherwise events past the budget are lost. The parent-death path is best effort. Dataset names for
-    loads are core's data_access_identity, recorded as given; any fallback load of a name (core's
-    data_access_identity_is_fallback) marks its dataset with an mlodaDataAccess facet (identityIsFallback true), so
-    consumers can tell a placeholder from a dataset. After a transport failure (connection, timeout, HTTP
+    delays every wrapped calculation. close() flushes the client, capped at close_timeout (default 1s) and the
+    worker's remaining close budget, and is terminal. A self-built client is rebuilt per worker; an injected client
+    that can't survive pickling is dropped by a trial-pickle probe and falls back to the resolution rule above,
+    while a picklable injected client is pickled as-is. Core calls close() with no args on graceful MULTIPROCESSING
+    worker exit; raise close_timeout together with graceful_shutdown_timeout for a buffered transport (e.g.
+    async_http, kafka) to fully drain, otherwise events past the budget are lost. The parent-death path is best
+    effort. Dataset names for loads are core's data_access_identity, recorded as given; any fallback load of a name
+    (core's data_access_identity_is_fallback) marks its dataset with an mlodaDataAccess facet (identityIsFallback
+    true), so consumers can tell a placeholder from a dataset. After a transport failure (connection, timeout, HTTP
     5xx/408/429) in a run, that run's new steps skip emission for a minute; steps already started still emit their
     terminal event, and raise_on_error=True disables the skip. Only OSError-based failures (requests transports such
-    as http) trip it; other transports (kafka, composite, cloud SDKs) never do. Stable subclass
-    seams: producer, job_namespace, dataset_namespace, _dispatch, _call_input_data_load, _call_calculate_feature,
+    as http) trip it; other transports (kafka, composite, cloud SDKs) never do. Stable subclass seams: producer,
+    job_namespace, dataset_namespace, _dispatch, _call_input_data_load, _call_calculate_feature,
     _calculate_run_facets, _calculate_output_facets, _run_with_events; pinned by
     assert_openlineage_extender_seams in mloda.testing."""
 
@@ -200,9 +200,9 @@ class OpenLineageExtender(Extender):
     # Core calls close() with no args on graceful MULTIPROCESSING worker exit and ignores the result.
     def close(self, timeout: float | None = None) -> bool:  # type: ignore[override]
         """Flush the underlying client, capped at close_timeout when timeout is None (core's own no-arg
-        call); pass timeout=-1 to wait with no limit and drain fully. A no-op if none has been built yet,
-        waiting out any build in flight. Otherwise every closer, including a sibling sharing an injected
-        client, waits for one flush."""
+        call); pass timeout=-1 to wait with no limit and drain fully (inside a worker close even -1 is capped by
+        the remaining close budget). A no-op if none has been built yet, waiting out any build in flight.
+        Otherwise every closer, including a sibling sharing an injected client, waits for one flush."""
         if timeout is None:
             timeout = self.close_timeout
         with self._client_lock:
@@ -218,6 +218,7 @@ class OpenLineageExtender(Extender):
                     _live_extenders.pop(id(self), None)
             state.closed = True
 
+        timeout = capped_close_timeout(timeout)
         remaining = timeout
         if timeout < 0:
             acquired = state.lock.acquire(timeout=-1)
