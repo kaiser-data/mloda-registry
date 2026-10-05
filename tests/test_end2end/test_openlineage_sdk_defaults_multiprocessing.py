@@ -48,14 +48,17 @@ def test_use_sdk_defaults_client_emits_inside_the_spawned_worker(
     )
     lines = [line for line in marker_path.read_text().splitlines() if line.strip()]
     assert lines, "marker file exists but has no content"
-    pids = set()
-    event_types = set()
+    worker_event_types = set()
     for line in lines:
         pid_str, _, event_type = line.partition(":")
-        pids.add(int(pid_str))
-        event_types.add(event_type)
-    assert os.getpid() not in pids, (
-        "OpenLineage events were emitted by the parent test process, not a spawned worker: "
-        f"parent pid {os.getpid()} appeared among emitting pids {pids}"
+        # The parent emits the run's own START/COMPLETE; only a worker's events prove the worker built a client.
+        if int(pid_str) != os.getpid():
+            worker_event_types.add(event_type)
+    assert {"START", "COMPLETE"} <= worker_event_types, (
+        f"no spawned worker emitted a START and COMPLETE event (parent pid {os.getpid()}): {lines}"
     )
-    assert {"START", "COMPLETE"} <= event_types
+
+    parent_lines = [line for line in lines if line.split(":", 1)[0] == str(os.getpid())]
+    assert [line.split(":", 1)[1] for line in parent_lines] == ["START", "COMPLETE"], (
+        f"the parent process must emit exactly the run START and COMPLETE, got {parent_lines}"
+    )

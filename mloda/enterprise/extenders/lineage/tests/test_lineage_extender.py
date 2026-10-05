@@ -333,8 +333,13 @@ def _job(feature_group: type[FeatureGroup], suffix: str = "") -> str:
     return f"{feature_group.__module__}.{feature_group.__qualname__}{suffix}"
 
 
+def _step_events(events: list[RunEvent]) -> list[RunEvent]:
+    """Drops the parent run's events (job mloda.run_all)."""
+    return [event for event in events if event.job.name != "mloda.run_all"]
+
+
 def _calculate_run_events(events: list[RunEvent]) -> list[RunEvent]:
-    return [event for event in events if not event.job.name.endswith(_VALIDATION_JOB_SUFFIXES)]
+    return [event for event in _step_events(events) if not event.job.name.endswith(_VALIDATION_JOB_SUFFIXES)]
 
 
 def _run(
@@ -551,8 +556,17 @@ def _structure_hash(func: Callable[..., Any] | None = None, args: tuple[Any, ...
 
 @pytest.fixture
 def ol_capture() -> Iterator[tuple[OpenLineageClient, RecordingTransport]]:
-    """A fresh, isolated (client, transport) pair per test."""
-    yield make_recording_client()
+    """A fresh, isolated (client, transport) pair per test. The transport drops the parent run's events (job
+    mloda.run_all), so these step-level tests see only step runs."""
+    client, transport = make_recording_client()
+    record = transport.emit
+
+    def emit_steps_only(event: Any) -> None:
+        if event.job.name != "mloda.run_all":
+            record(event)
+
+    transport.emit = emit_steps_only  # type: ignore[method-assign]
+    yield client, transport
 
 
 class TestLineageFacetsExtenderContract(OpenLineageExtenderTestMixin):
@@ -801,7 +815,7 @@ class TestLineageFacetsMasking:
     """Masking is declared, never inferred: a class attribute or the feature's own context option, both `is True`."""
 
     @pytest.mark.parametrize(("feature_group", "make_options"), _MASKED_CASES)
-    def test_declared_masking_marks_the_transformation_and_lists_the_feature(
+    def test_declared_masking_is_listed_but_sets_no_standard_masking(
         self,
         ol_capture: tuple[OpenLineageClient, RecordingTransport],
         feature_group: type[_Derived],
@@ -814,9 +828,9 @@ class TestLineageFacetsMasking:
 
         events = _events_for(transport.events, _job(feature_group))
         assert [event.eventType for event in events] == [RunState.START, RunState.COMPLETE]
-        assert [t.masking for t in _transformations(events[-1], name)] == [True]
-        assert all(_run_facet(event).maskedFeatures == [name] for event in events)
-        assert all(_run_facet(event).maskedFeatures == [] for event in _events_for(transport.events, _job(_Root)))
+        assert [t.masking for t in _transformations(events[-1], name)] == [None]
+        assert all(_run_facet(event).declaredMasking == [name] for event in events)
+        assert all(_run_facet(event).declaredMasking == [] for event in _events_for(transport.events, _job(_Root)))
 
     @pytest.mark.parametrize(("feature_group", "make_options"), _NOT_MASKED_CASES)
     def test_undeclared_or_misdeclared_masking_is_ignored(
@@ -833,8 +847,8 @@ class TestLineageFacetsMasking:
         events = _events_for(transport.events, _job(feature_group))
         assert [event.eventType for event in events] == [RunState.START, RunState.COMPLETE]
         assert [t.masking for t in _transformations(events[-1], name)] == [None]
-        assert all(_run_facet(event).maskedFeatures == [] for event in events)
-        assert all(_run_facet(event).maskedFeatures == [] for event in _events_for(transport.events, _job(_Root)))
+        assert all(_run_facet(event).declaredMasking == [] for event in events)
+        assert all(_run_facet(event).declaredMasking == [] for event in _events_for(transport.events, _job(_Root)))
 
     def test_a_forwarded_context_key_masks_only_the_declaring_step(
         self, ol_capture: tuple[OpenLineageClient, RecordingTransport]
@@ -848,9 +862,9 @@ class TestLineageFacetsMasking:
         _run(LineageFacetsExtender(client=client), [Feature(name, options=options)], _Derived)
 
         derived_events = _events_for(transport.events, _job(_Derived))
-        assert [t.masking for t in _transformations(derived_events[-1], name)] == [True]
-        assert all(_run_facet(event).maskedFeatures == [name] for event in derived_events)
-        assert all(_run_facet(event).maskedFeatures == [] for event in _events_for(transport.events, _job(_Root)))
+        assert [t.masking for t in _transformations(derived_events[-1], name)] == [None]
+        assert all(_run_facet(event).declaredMasking == [name] for event in derived_events)
+        assert all(_run_facet(event).declaredMasking == [] for event in _events_for(transport.events, _job(_Root)))
 
     @pytest.mark.parametrize(("make_options", "top_masked"), _CONSUMER_HELD_CASES)
     def test_a_steps_own_option_counts_even_when_its_consumer_holds_it(
@@ -874,10 +888,10 @@ class TestLineageFacetsMasking:
 
         mid_events = _events_for(transport.events, _job(_MidStep))
         assert [event.eventType for event in mid_events] == [RunState.START, RunState.COMPLETE]
-        assert all(_run_facet(event).maskedFeatures == [mid] for event in mid_events)
-        assert [t.masking for t in _transformations(mid_events[-1], mid)] == [True]
+        assert all(_run_facet(event).declaredMasking == [mid] for event in mid_events)
+        assert [t.masking for t in _transformations(mid_events[-1], mid)] == [None]
         top_events = _events_for(transport.events, _job(_TopRequestingMaskedMid))
-        assert all(_run_facet(event).maskedFeatures == ([top] if top_masked else []) for event in top_events)
+        assert all(_run_facet(event).declaredMasking == ([top] if top_masked else []) for event in top_events)
 
     @pytest.mark.parametrize("order", _SEVERAL_CONSUMERS_ORDERS)
     def test_several_consumers_own_key_counts_regardless_of_request_order(
@@ -899,8 +913,8 @@ class TestLineageFacetsMasking:
 
         mid_events = _events_for(transport.events, _job(_MidStep))
         assert [event.eventType for event in mid_events] == [RunState.START, RunState.COMPLETE]
-        assert all(_run_facet(event).maskedFeatures == [mid] for event in mid_events)
-        assert [t.masking for t in _transformations(mid_events[-1], mid)] == [True]
+        assert all(_run_facet(event).declaredMasking == [mid] for event in mid_events)
+        assert [t.masking for t in _transformations(mid_events[-1], mid)] == [None]
 
     @pytest.mark.parametrize(("sharing", "root"), _SHARING_CASES)
     def test_input_features_sharing_the_consumer_options_are_masked_by_them_too(
@@ -924,9 +938,9 @@ class TestLineageFacetsMasking:
 
         root_events = _events_for(transport.events, _job(root))
         assert [event.eventType for event in root_events] == [RunState.START, RunState.COMPLETE]
-        assert all(_run_facet(event).maskedFeatures == [root_name] for event in root_events)
+        assert all(_run_facet(event).declaredMasking == [root_name] for event in root_events)
         sharing_events = _events_for(transport.events, _job(sharing))
-        assert all(_run_facet(event).maskedFeatures == [name] for event in sharing_events)
+        assert all(_run_facet(event).declaredMasking == [name] for event in sharing_events)
 
     def test_masking_is_declared_per_feature_within_a_step(
         self, ol_capture: tuple[OpenLineageClient, RecordingTransport]
@@ -941,9 +955,9 @@ class TestLineageFacetsMasking:
 
         events = _events_for(transport.events, _job(_MultiOutput))
         assert [event.eventType for event in events] == [RunState.START, RunState.COMPLETE]
-        assert all(_run_facet(event).maskedFeatures == sorted(masked) for event in events)
+        assert all(_run_facet(event).declaredMasking == sorted(masked) for event in events)
         for name in masked:
-            assert [t.masking for t in _transformations(events[-1], name)] == [True]
+            assert [t.masking for t in _transformations(events[-1], name)] == [None]
         assert [t.masking for t in _transformations(events[-1], plain)] == [None]
 
     def test_class_attribute_masks_every_feature_of_the_step_sorted(
@@ -954,9 +968,9 @@ class TestLineageFacetsMasking:
         with make_hook_context(feature_names=("zeta", "alpha"), input_features=frozenset({"src"})).activate():
             LineageFacetsExtender(client=client)(_MaskedByAttribute.calculate_feature, None, FeatureSet())
 
-        assert all(_run_facet(event).maskedFeatures == ["alpha", "zeta"] for event in transport.events)
+        assert all(_run_facet(event).declaredMasking == ["alpha", "zeta"] for event in transport.events)
         for name in ("alpha", "zeta"):
-            assert [t.masking for t in _transformations(transport.events[-1], name)] == [True]
+            assert [t.masking for t in _transformations(transport.events[-1], name)] == [None]
 
 
 _DECLARED_CASES = [
@@ -1055,8 +1069,8 @@ _DERIVED_INPUTS = [
 ]
 
 _MASKED_ROOT_CASES = [
-    pytest.param(_MaskedSourceByDict, lambda: Options(), True, id="class attribute"),
-    pytest.param(_SourceByDict, lambda: Options(context={"masking": True}), True, id="own context option"),
+    pytest.param(_MaskedSourceByDict, lambda: Options(), None, id="class attribute"),
+    pytest.param(_SourceByDict, lambda: Options(context={"masking": True}), None, id="own context option"),
     pytest.param(_SourceByDict, lambda: Options(), None, id="not masked"),
 ]
 
@@ -1294,7 +1308,7 @@ class TestLineageFacetsRootSourceColumns:
             assert _column_lineage(event, name).fields == {name: expected}
 
     @pytest.mark.parametrize(("feature_group", "make_options", "masking"), _MASKED_ROOT_CASES)
-    def test_declared_masking_marks_the_root_edge_transformation(
+    def test_declared_masking_sets_no_standard_masking_on_the_root_edge_transformation(
         self,
         ol_capture: tuple[OpenLineageClient, RecordingTransport],
         feature_group: type[_Loading],
@@ -1313,7 +1327,7 @@ class TestLineageFacetsRootSourceColumns:
 
         event = _calculate_loading_step(ol_capture, _SourceByTwoColumnDict, options)
 
-        assert _column_lineage(event, "out").fields == {"out": _root_edge(_LOADED, "src_out", True)}
+        assert _column_lineage(event, "out").fields == {"out": _root_edge(_LOADED, "src_out")}
         assert _column_lineage(event, "second").fields == {"second": _root_edge(_LOADED, "src_second")}
 
     @pytest.mark.parametrize(("feature_group", "make_options", "sources"), _DECLARED_CASES)
@@ -1653,7 +1667,7 @@ class TestLineageFacetsValidationRuns:
 
         _run(LineageFacetsExtender(client=client), list(_PassingValidators.outputs), _PassingValidators)
 
-        assert {event.job.name for event in transport.events} == {
+        assert {event.job.name for event in _step_events(transport.events)} == {
             _job(_Root),
             _job(_PassingValidators),
             _job(_PassingValidators, f".{_VALIDATE_INPUT}"),
@@ -1819,7 +1833,7 @@ class TestLineageFacetsRunFacet:
                 "2.5.0",
                 "MyFramework",
             )
-            assert facet.maskedFeatures == []
+            assert facet.declaredMasking == []
             assert _parent_run_id(event) == run_id
             payload = json.loads(Serde.to_json(event))
             assert payload["run"]["facets"]["mloda"]["structureHash"] == facet.structureHash
@@ -1940,7 +1954,7 @@ class TestLineageFacetsRunFacet:
             return {
                 event.job.name: _run_facet(event).structureHash
                 for event in transport.events
-                if event.eventType == RunState.START
+                if event.eventType == RunState.START and event.job.name != "mloda.run_all"
             }
 
         first, second = start_hashes(), start_hashes()
@@ -2023,6 +2037,6 @@ class TestLineageFacetsBareCalls:
                 assert LineageFacetsExtender(client=client)(lambda: None) is None
 
         assert [event.eventType for event in transport.events] == [RunState.START, RunState.COMPLETE]
-        assert all(_run_facet(event).maskedFeatures == [] for event in transport.events)
+        assert all(_run_facet(event).declaredMasking == [] for event in transport.events)
         assert [t.masking for t in _transformations(transport.events[-1], "out")] == [None]
         assert [record for record in caplog.records if record.levelno >= logging.WARNING] == []
