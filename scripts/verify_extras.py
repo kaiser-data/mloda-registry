@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""Install each internal extra and prove it gates exactly its members' imports.
+"""Install each internal extra and prove it gates exactly its members' imports, and each third-party extra
+imports and registers its plugins.
 
 Internal extras are the non-dev extras of published packages whose members are configured package
 keys. ``{published_children}`` expands as the generator does; the shared default extras from
 config/shared.toml declare only ``dev``, which is skipped, so they are never merged here.
 
+Third-party extras (bundle extras naming non-configured distributions) are installed too: each named
+distribution must be present and each binary wheel must register a feature group whose binary exists.
+
 Jobs run concurrently through a bounded thread pool: one bare install per owning package (its
 extras' members combined), then one gated install per extra.
 
 Run: python scripts/verify_extras.py <version>
-Exit code: 1 if any member imports without its extra or fails to import with it, 0 otherwise.
+Exit code: 1 if any member imports without its extra or fails to import with it, or any third-party extra
+fails to install or probe, 0 otherwise.
 """
 
 from __future__ import annotations
@@ -65,6 +70,90 @@ def internal_extra_members(packages: dict[str, dict[str, Any]]) -> list[tuple[st
     return entries
 
 
+def external_bundle_extras(packages: dict[str, dict[str, Any]]) -> list[tuple[str, str, list[str], list[str]]]:
+    """(bundle, extra, external distributions, binary wheel distributions) per non-dev extra of a published
+    entry_point_bundle naming a non-configured distribution, in config order. Binary wheels are the external
+    names in the ``wheel`` extra of a nested leaf the bundle ships (nested, not owned)."""
+    gen = _load_sibling("generate_pyproject")
+    normalize: Callable[[str], str] = gen.normalize_package_name
+    dep_name: Callable[[str], str | None] = gen.normalize_dependency_name
+    configured = {normalize(name) for name in packages}
+
+    entries: list[tuple[str, str, list[str], list[str]]] = []
+    for pkg_name, pkg_config in packages.items():
+        if pkg_config.get("published") is not True or not pkg_config.get("entry_point_bundle"):
+            continue
+        shipped = gen.bundle_shipped_names(pkg_config, packages)
+        wheel_names = {
+            dep_name(dep.split(";", 1)[0])
+            for leaf in shipped
+            for dep in packages[leaf].get("optional_dependencies", {}).get("wheel", [])
+        }
+        for extra, deps in gen.expand_published_children(pkg_config, packages).items():
+            if extra == DEV_EXTRA:
+                continue
+            external = [
+                match.group(1)
+                for dep in deps
+                if (match := gen.DEP_NAME_RE.match(dep.split(";", 1)[0]))
+                and normalize(match.group(1)) not in configured
+            ]
+            if external:
+                binaries = [n for n in external if normalize(n) in wheel_names]
+                entries.append((pkg_name, extra, external, binaries))
+    return entries
+
+
+def external_extra_probe(distributions: list[str], binary_distributions: list[str]) -> str:
+    """Python program run in the install's venv: every distribution is installed and its modules import, every
+    plugin entry point loads, every binary wheel's feature group points at an existing binary. Failures exit
+    non-zero with one message naming the distribution or entry point."""
+    return f"""\
+import importlib
+import importlib.metadata as md
+import re
+import sys
+
+
+def norm(name):
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+for d in {distributions!r}:
+    dist = md.distribution(d)
+    top_level = dist.read_text("top_level.txt")
+    if top_level:
+        modules = set(top_level.split())
+    else:
+        modules = {{f.parts[0] if len(f.parts) > 1 else f.stem for f in dist.files or [] if f.suffix == ".py"}}
+    if not modules:
+        sys.exit(f"distribution {{d}} provides no top-level module")
+    for module in sorted(modules):
+        try:
+            importlib.import_module(module)
+        except Exception as exc:
+            sys.exit(f"distribution {{d}}: import {{module}} failed: {{exc!r}}")
+
+classes = []
+for group in ("mloda.feature_groups", "mloda.extenders", "mloda.compute_frameworks"):
+    for entry_point in md.entry_points(group=group):
+        try:
+            loaded = entry_point.load()
+        except Exception as exc:
+            sys.exit(f"entry point {{group}}:{{entry_point.name}} failed to load: {{exc!r}}")
+        if group == "mloda.feature_groups":
+            classes.extend(loaded)
+
+for d in {binary_distributions!r}:
+    matches = [c for c in classes if norm(getattr(c, "BINARY_WHEEL_DISTRIBUTION", "")) == norm(d)]
+    if not matches:
+        sys.exit(f"no feature group for binary wheel {{d}}")
+    plugin = importlib.import_module(matches[0].BINARY_PLUGIN_ID)
+    if not plugin.binary_path().exists():
+        sys.exit(f"binary missing for {{d}}")
+"""
+
+
 def verification_jobs(
     entries: list[tuple[str, str, list[str]]], version: str
 ) -> list[tuple[str, str, bool, list[str]]]:
@@ -89,6 +178,23 @@ def verification_jobs(
     return jobs
 
 
+_venv_python: Callable[[Path], Path] = _load_sibling("verify_build_floor").venv_python
+
+
+def _create_venv_and_install(specifier: str, venv: Path, tmpdir: str) -> str | None:
+    """Create a fresh venv and install ``specifier`` into it; the error message on failure, else None."""
+    setup = [
+        ["uv", "venv", "--python", sys.executable, str(venv)],
+        ["uv", "pip", "install", "--python", str(_venv_python(venv)), specifier],
+    ]
+    for command in setup:
+        # cwd is the temp dir, so the checkout cannot shadow the installed packages.
+        result = subprocess.run(command, capture_output=True, text=True, cwd=tmpdir)  # nosec
+        if result.returncode != 0:
+            return f"{specifier}: {' '.join(command)} failed:\n{result.stderr[-500:]}"
+    return None
+
+
 def _install_and_probe(
     specifier: str,
     owner_modules: tuple[str, ...],
@@ -101,31 +207,23 @@ def _install_and_probe(
     Prints nothing, so callers running several of these concurrently control all output themselves.
     Returns (messages, errors).
     """
-    from verify_build_floor import venv_python
-
     venv = Path(tmpdir) / "venv"
-    setup = [
-        ["uv", "venv", "--python", sys.executable, str(venv)],
-        ["uv", "pip", "install", "--python", str(venv_python(venv)), specifier],
-    ]
-    for command in setup:
-        # cwd is the temp dir, so the checkout cannot shadow the installed packages.
-        result = subprocess.run(command, capture_output=True, text=True, cwd=tmpdir)  # nosec
-        if result.returncode != 0:
-            return [], [f"{specifier}: {' '.join(command)} failed:\n{result.stderr[-500:]}"]
+    failure = _create_venv_and_install(specifier, venv, tmpdir)
+    if failure is not None:
+        return [], [failure]
 
     messages: list[str] = []
     errors: list[str] = []
     # The owning package itself must import with and without its extra.
     for module in owner_modules:
-        command = [str(venv_python(venv)), "-c", f"import {module}"]
+        command = [str(_venv_python(venv)), "-c", f"import {module}"]
         result = subprocess.run(command, capture_output=True, text=True, cwd=tmpdir)  # nosec
         if result.returncode != 0:
             errors.append(f"{specifier}: import {module} failed:\n{result.stderr[-500:]}")
         else:
             messages.append(f"  ✓ base package OK: {module}")
     for member, module in member_modules.items():
-        command = [str(venv_python(venv)), "-c", f"import {module}"]
+        command = [str(_venv_python(venv)), "-c", f"import {module}"]
         result = subprocess.run(command, capture_output=True, text=True, cwd=tmpdir)  # nosec
         if expect_import:
             if result.returncode == 0:
@@ -146,8 +244,41 @@ def _install_and_probe(
     return messages, errors
 
 
+def _install_and_probe_external(
+    specifier: str,
+    owner_modules: tuple[str, ...],
+    distributions: list[str],
+    binary_distributions: list[str],
+    tmpdir: str,
+) -> tuple[list[str], list[str]]:
+    """Install one third-party extra into a fresh venv, import the owner surface, then run the probe."""
+    venv = Path(tmpdir) / "venv"
+    failure = _create_venv_and_install(specifier, venv, tmpdir)
+    if failure is not None:
+        return [], [failure]
+
+    python = str(_venv_python(venv))
+    messages: list[str] = []
+    errors: list[str] = []
+    for module in owner_modules:
+        result = subprocess.run([python, "-c", f"import {module}"], capture_output=True, text=True, cwd=tmpdir)  # nosec
+        if result.returncode != 0:
+            errors.append(f"{specifier}: import {module} failed:\n{result.stderr[-500:]}")
+        else:
+            messages.append(f"  ✓ base package OK: {module}")
+    probe = external_extra_probe(distributions, binary_distributions)
+    result = subprocess.run([python, "-c", probe], capture_output=True, text=True, cwd=tmpdir)  # nosec
+    if result.returncode != 0:
+        errors.append(f"{specifier}: probe failed:\n{result.stderr[-500:]}")
+    else:
+        messages.append(f"  ✓ installed: {', '.join(distributions)}")
+    return messages, errors
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Verify each internal extra gates exactly its members' imports")
+    parser = argparse.ArgumentParser(
+        description="Verify internal extras gate their members' imports and third-party extras install and load"
+    )
     parser.add_argument("version", nargs="?", default="", help="Released version to install every package at")
     args = parser.parse_args()
 
@@ -161,10 +292,14 @@ def main() -> int:
 
     packages = load_packages_config()
     entries = internal_extra_members(packages)
+    external_entries = external_bundle_extras(packages)
 
     # An empty set would silently verify nothing.
     if not entries:
         print("❌ config/packages.toml declares no internal extras")
+        return 1
+    if not external_entries:
+        print("❌ config/packages.toml declares no third-party bundle extras")
         return 1
 
     # The single derivation point for import surfaces lives in verify_published_imports.
@@ -172,8 +307,12 @@ def main() -> int:
     max_workers: int = _load_sibling("verify_independent_installs").MAX_WORKERS
 
     jobs = verification_jobs(entries, args.version)
-    workers = min(len(jobs), max_workers)
-    print(f"\nInstalling {len(jobs)} jobs at {args.version}, {workers} at a time...")
+    external_jobs = [
+        (f"{bundle}[{extra}]=={args.version}", surface(str(packages[bundle]["path"])), names, binaries)
+        for bundle, extra, names, binaries in external_entries
+    ]
+    workers = min(len(jobs) + len(external_jobs), max_workers)
+    print(f"\nInstalling {len(jobs) + len(external_jobs)} jobs at {args.version}, {workers} at a time...")
 
     def _run(job: tuple[str, str, bool, list[str]]) -> tuple[list[str], list[str]]:
         package, specifier, expect_import, members = job
@@ -182,11 +321,21 @@ def main() -> int:
         with tempfile.TemporaryDirectory() as tmpdir:
             return _install_and_probe(specifier, owner_modules, expect_import, member_modules, tmpdir)
 
+    def _run_external(job: tuple[str, tuple[str, ...], list[str], list[str]]) -> tuple[list[str], list[str]]:
+        specifier, owner_modules, names, binaries = job
+        with tempfile.TemporaryDirectory() as tmpdir:
+            return _install_and_probe_external(specifier, owner_modules, names, binaries, tmpdir)
+
     errors: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         # map() preserves job order, so per-job output stays deterministic.
-        for job, (messages, job_errors) in zip(jobs, executor.map(_run, jobs)):
-            print(f"\nInstalling {job[1]}...")
+        internal_results = executor.map(_run, jobs)
+        external_results = executor.map(_run_external, external_jobs)
+        for specifier, (messages, job_errors) in [
+            *zip((job[1] for job in jobs), internal_results),
+            *zip((job[0] for job in external_jobs), external_results),
+        ]:
+            print(f"\nInstalling {specifier}...")
             for message in messages:
                 print(message)
             errors.extend(job_errors)
@@ -197,7 +346,7 @@ def main() -> int:
             print(f"  - {error}")
         return 1
 
-    print(f"\n✅ every internal extra gates exactly its members at {args.version}")
+    print(f"\n✅ internal extras gate their members and third-party extras install at {args.version}")
     return 0
 
 

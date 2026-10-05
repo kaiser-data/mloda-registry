@@ -281,7 +281,7 @@ python scripts/generate_pyproject.py    # Regenerate
    package also `entry_point_groups = ["mloda.feature_groups" | ...]`), above the
    `# --- Bundles ---` marker and after every published package it depends on:
    `scripts/published_packages.py` rejects a config that is not dependency-first.
-2. For a plugin package, create `<path>/manifest.py` listing the concrete classes.
+2. Create `<path>/__init__.py` before generating; for a plugin package, also create `<path>/manifest.py` listing the concrete classes.
 3. If it should ship standalone on PyPI, set `published = true` and add the name to
    `_EXPECTED_PUBLISHED` in `tests/test_end2end/test_published_set_single_source.py`;
    otherwise add it to `_BUNDLE_ONLY` there. The gate checks both lists against config, in
@@ -325,8 +325,8 @@ dependency (today `cryptography` behind `mloda-enterprise[ed25519]` and `opentel
 5. Add the install row to the README and to the install table under
    [Individual packages](#individual-packages).
 
-Keep the floor in the bundle extra and in the leaf `dev` entry equal. `test_bundle_extra_floor_matches_leaf_dev_entry`
-enforces that pair.
+Keep the floor in the bundle extra and in the leaf `dev` entry equal. `test_bundle_extra_floor_matches_leaf_extra_entry`
+enforces that pair for every nested leaf the bundle wheel ships (owned leaves ship their own wheel and are skipped).
 
 The dependency can also be a first-party sibling (`mloda-community-openlineage` behind
 `mloda-enterprise[openlineage]`). Spell its floor `{version}` in both places

@@ -13,7 +13,9 @@ a nested package stays out of its parent's wheel, published or not, with the
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess  # nosec
 import sys
 from collections.abc import Callable
 from copy import deepcopy
@@ -24,6 +26,7 @@ from typing import Any
 import pytest
 
 from tests.script_loader import load_script, version_tuple
+from tests.test_end2end.test_verify_independent_installs import _FakeCompletedProcess
 from tests.toml_loader import load_toml, loads_toml
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -600,6 +603,24 @@ def test_bundle_owned_names_matches_the_published_nested_packages_exactly() -> N
     )
 
 
+def test_bundle_shipped_names_are_the_nested_packages_the_bundle_does_not_own() -> None:
+    """Nested packages minus owned ones, in config order; a non-bundle yields []."""
+    packages: dict[str, dict[str, Any]] = {
+        "sb": {
+            **_synthetic_pkg("sb", dependencies=["sb-owned=={version}"]),
+            "entry_point_bundle": True,
+        },
+        "sb-shipped-a": _synthetic_pkg("sb/a", published=None),
+        "sb-owned": _synthetic_pkg("sb/owned"),
+        "sb-shipped-b": _synthetic_pkg("sb/b", published=None),
+        "other": _synthetic_pkg("other"),
+    }
+    shipped = gen.bundle_shipped_names(packages["sb"], packages)
+
+    assert shipped == ["sb-shipped-a", "sb-shipped-b"], f"bundle_shipped_names() returned {shipped!r}"
+    assert gen.bundle_shipped_names(packages["other"], packages) == []
+
+
 def test_published_packages_rejects_a_non_boolean_flag() -> None:
     """A truthiness test publishes on 'published = "false"', so a non-boolean flag must be rejected."""
     packages: dict[str, dict[str, Any]] = {
@@ -1043,6 +1064,265 @@ def test_verification_jobs_of_an_empty_entries_list_is_empty() -> None:
     """No internal extras means no install jobs at all."""
     jobs = _verification_jobs([], "9.9.9")
     assert jobs == [], f"verification_jobs([], ...) returned {jobs!r}, expected an empty list"
+
+
+_EXTERNAL_EXTRAS_FN = "external_bundle_extras"
+_EXTERNAL_JOB_FN = "_install_and_probe_external"
+
+
+def _external_extra_entries(
+    packages: dict[str, dict[str, Any]],
+) -> list[tuple[str, str, list[str], list[str]]]:
+    """The (bundle, extra, external distributions, binary wheel distributions) entries verify_extras derives."""
+    entries = _script_fn(
+        _EXTRAS_SCRIPT, _EXTERNAL_EXTRAS_FN, "derive the third-party bundle extras to verify from config/packages.toml"
+    )(packages)
+    return [(bundle, extra, list(names), list(binaries)) for bundle, extra, names, binaries in entries]
+
+
+def _external_extra_probe(distributions: list[str], binary_distributions: list[str]) -> str:
+    """The probe program source verify_extras runs in the venv of an external-extra install."""
+    source: str = _script_fn(
+        _EXTRAS_SCRIPT, "external_extra_probe", "build the probe program for an external extra install"
+    )(distributions, binary_distributions)
+    return source
+
+
+def _run_probe(
+    distributions: list[str], binary_distributions: list[str], env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run the probe program with the dev interpreter (optionally with an explicit environment)."""
+    source = _external_extra_probe(distributions, binary_distributions)
+    return subprocess.run([sys.executable, "-c", source], capture_output=True, text=True, env=env)  # nosec
+
+
+def _fake_dist(
+    root: Path,
+    *,
+    binary_exists: bool = True,
+    broken_module: bool = False,
+    broken_entry_point: bool = False,
+) -> dict[str, str]:
+    """Install a fake ``fakebin`` distribution under ``root``; returns an env putting it on PYTHONPATH.
+
+    It registers a ``mloda.feature_groups`` entry point to ``fake_fg`` (one class naming the ``fake_plugin``
+    binary module). ``broken_module`` makes its top-level module ``fakebin_mod`` raise on import;
+    ``broken_entry_point`` makes the entry point target a missing attribute."""
+    info = root / "fakebin-0.1.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text("Metadata-Version: 2.1\nName: fakebin\nVersion: 0.1\n")
+    top_level = ["fake_fg", "fake_plugin", "fakebin_mod"]
+    (info / "top_level.txt").write_text("\n".join(top_level) + "\n")
+    target = "FEATURE_GROUPS_MISSING" if broken_entry_point else "FEATURE_GROUPS"
+    (info / "entry_points.txt").write_text(f"[mloda.feature_groups]\nfakebin = fake_fg:{target}\n")
+    (root / "fake_fg.py").write_text(
+        "class FakeFG:\n"
+        '    BINARY_WHEEL_DISTRIBUTION = "fakebin"\n'
+        '    BINARY_PLUGIN_ID = "fake_plugin"\n\n\n'
+        "FEATURE_GROUPS = [FakeFG]\n"
+    )
+    (root / "fakebin_mod.py").write_text("raise ImportError('fakebin_mod is broken')\n" if broken_module else "")
+    binary_name = "__init__.py" if binary_exists else "absent.bin"
+    plugin = root / "fake_plugin"
+    plugin.mkdir()
+    (plugin / "__init__.py").write_text(
+        "from pathlib import Path\n\n\n"
+        f"def binary_path() -> Path:\n    return Path(__file__).parent / {binary_name!r}\n"
+    )
+    return {**os.environ, "PYTHONPATH": str(root)}
+
+
+def _fake_external_run(
+    monkeypatch: pytest.MonkeyPatch, failing: Callable[[list[list[str]]], bool] | None = None, stderr: str = ""
+) -> list[list[str]]:
+    """Replace the script's subprocess.run with a recorder; ``failing(calls)`` is checked after each call is recorded."""
+    calls: list[list[str]] = []
+    module = load_script(_EXTRAS_SCRIPT.stem, _EXTRAS_SCRIPT)
+
+    def _fake_run(command: list[str], *args: Any, **kwargs: Any) -> _FakeCompletedProcess:
+        calls.append(command)
+        if failing is not None and failing(calls):
+            return _FakeCompletedProcess(1, stderr=stderr)
+        return _FakeCompletedProcess(0)
+
+    monkeypatch.setattr(module.subprocess, "run", _fake_run)
+    return calls
+
+
+def _run_external_job(tmp_path: Path, binaries: list[str]) -> tuple[list[str], list[str]]:
+    """Run one external job for the enterprise anonymizer extra against the (faked) subprocess.run."""
+    result: tuple[list[str], list[str]] = _script_fn(
+        _EXTRAS_SCRIPT, _EXTERNAL_JOB_FN, "install one third-party extra and probe it"
+    )(
+        "mloda-enterprise[anonymizer]==9.9.9",
+        ("mloda.enterprise",),
+        ["mloda-anonymizer-binary", "pyarrow"],
+        binaries,
+        str(tmp_path),
+    )
+    return result
+
+
+def test_external_bundle_extras_yields_exactly_the_third_party_bundle_extras() -> None:
+    """The bundle extras that name third-party distributions are the ones never installed by the internal jobs."""
+    entries = _external_extra_entries(_packages())
+    expected = [
+        ("mloda-enterprise", "ed25519", ["cryptography"], []),
+        ("mloda-enterprise", "otel", ["opentelemetry-api"], []),
+        ("mloda-enterprise", "anonymizer", ["mloda-anonymizer-binary", "pyarrow"], ["mloda-anonymizer-binary"]),
+    ]
+    assert entries == expected, f"external_bundle_extras() yielded {entries!r}, expected exactly {expected!r}"
+
+
+def test_external_bundle_extras_synthetic_config_applies_every_rule() -> None:
+    """Skips dev, configured-only extras, non-bundle and unpublished-bundle packages; keeps only the external
+    names of a mixed extra; takes binary wheels only from a shipped leaf's wheel extra, not an owned leaf's."""
+    packages: dict[str, dict[str, Any]] = {
+        "sb": {
+            "description": "sandbox",
+            "path": "sb",
+            "published": True,
+            "entry_point_bundle": True,
+            "dependencies": ["sb-owned=={version}"],
+            "optional_dependencies": {
+                "dev": ["pytest>=9"],
+                "internal": ["sb-owned=={version}"],
+                "mixed": ["  Foo_Bar>=1", "sb-owned=={version}", "bar-binary>=0.1", "ownedbin>=1"],
+                "plain": ["baz>=2"],
+            },
+        },
+        "sb-owned": {
+            "description": "sandbox",
+            "path": "sb/owned",
+            "published": True,
+            "optional_dependencies": {"wheel": ["ownedbin>=1"]},
+        },
+        "sb-shipped": {
+            "description": "sandbox",
+            "path": "sb/shipped",
+            "entry_point_groups": ["mloda.feature_groups"],
+            "optional_dependencies": {"wheel": ["bar-binary>=0.1,<0.2"]},
+        },
+        "plain-pkg": {
+            "description": "sandbox",
+            "path": "plain",
+            "published": True,
+            "optional_dependencies": {"x": ["notbundle>=1"]},
+        },
+        "hidden": {
+            "description": "sandbox",
+            "path": "hidden",
+            "entry_point_bundle": True,
+            "optional_dependencies": {"x": ["hiddenext>=1"]},
+        },
+    }
+
+    entries = _external_extra_entries(packages)
+
+    expected = [
+        ("sb", "mixed", ["Foo_Bar", "bar-binary", "ownedbin"], ["bar-binary"]),
+        ("sb", "plain", ["baz"], []),
+    ]
+    assert entries == expected, f"external_bundle_extras() yielded {entries!r}, expected exactly {expected!r}"
+
+
+def test_external_job_runs_venv_install_owner_import_then_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The external job creates a fresh venv, installs the extra, imports the owner surface, then runs the probe."""
+    calls = _fake_external_run(monkeypatch)
+
+    messages, errors = _run_external_job(tmp_path, ["mloda-anonymizer-binary"])
+
+    assert errors == [], f"_install_and_probe_external() reported {errors!r} for an all-success fake"
+    assert len(calls) == 4, f"expected venv, install, owner import and probe (4 commands), got {calls!r}"
+    assert calls[0][:2] == ["uv", "venv"], f"first command must create the venv, got {calls[0]!r}"
+    assert calls[1][:3] == ["uv", "pip", "install"], f"second command must install, got {calls[1]!r}"
+    assert calls[1][-1] == "mloda-enterprise[anonymizer]==9.9.9", f"install must end with the specifier: {calls[1]!r}"
+    assert calls[2][1:] == ["-c", "import mloda.enterprise"], f"third command must import the owner: {calls[2]!r}"
+    probe = _external_extra_probe(["mloda-anonymizer-binary", "pyarrow"], ["mloda-anonymizer-binary"])
+    assert calls[3][1] == "-c" and calls[3][2] == probe, f"last command must run the probe program: {calls[3]!r}"
+    assert calls[2][0] == calls[3][0], "owner import and probe must use the same venv python"
+
+
+def test_external_job_stops_when_the_install_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A failed install is reported against the specifier and nothing runs after it."""
+    calls = _fake_external_run(
+        monkeypatch, failing=lambda calls: calls[-1][:3] == ["uv", "pip", "install"], stderr="boom"
+    )
+
+    messages, errors = _run_external_job(tmp_path, [])
+
+    assert len(calls) == 2, f"commands after the failed install must not run, got {calls!r}"
+    assert len(errors) == 1 and "mloda-enterprise[anonymizer]==9.9.9" in errors[0] and "boom" in errors[0], errors
+
+
+def test_external_job_reports_a_failing_probe(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A probe that exits non-zero becomes an error carrying the specifier and the probe's message."""
+    _fake_external_run(monkeypatch, failing=lambda calls: len(calls) == 4, stderr="missing-dist")
+
+    messages, errors = _run_external_job(tmp_path, ["mloda-anonymizer-binary"])
+
+    assert len(errors) == 1 and "mloda-enterprise[anonymizer]==9.9.9" in errors[0] and "missing-dist" in errors[0], (
+        errors
+    )
+
+
+def test_external_probe_fails_naming_a_missing_binary_wheel() -> None:
+    """A binary wheel that is not installed makes the probe exit non-zero and name it."""
+    missing = "nonexistent-dist-binary"
+    result = _run_probe(["pyarrow"], [missing])
+
+    assert result.returncode != 0, f"probe exited 0 although {missing} is not installed"
+    assert missing in result.stderr, f"probe stderr must name the distribution: {result.stderr!r}"
+
+
+def test_external_probe_passes_for_installed_distributions_without_a_binary() -> None:
+    """An installed external distribution with no binary wheel needs only the version lookup."""
+    result = _run_probe(["pyarrow"], [])
+
+    assert result.returncode == 0, f"probe exited {result.returncode} for installed pyarrow: {result.stderr!r}"
+
+
+def test_external_probe_passes_for_a_fake_distribution_whose_binary_exists(tmp_path: Path) -> None:
+    """Already passes today: the binary check is unchanged in meaning."""
+    result = _run_probe(["fakebin"], ["fakebin"], _fake_dist(tmp_path))
+
+    assert result.returncode == 0, f"probe exited {result.returncode}: {result.stderr!r}"
+
+
+def test_external_probe_fails_naming_a_fake_distribution_with_a_missing_binary(tmp_path: Path) -> None:
+    """Already passes today (binary_path().exists() is False -> exit naming the distribution)."""
+    result = _run_probe(["fakebin"], ["fakebin"], _fake_dist(tmp_path, binary_exists=False))
+
+    assert result.returncode != 0 and "fakebin" in result.stderr, result.stderr
+
+
+def test_external_probe_fails_naming_a_distribution_whose_module_does_not_import(tmp_path: Path) -> None:
+    """The probe imports every top-level module of each distribution, not just its metadata."""
+    result = _run_probe(["fakebin"], [], _fake_dist(tmp_path, broken_module=True))
+
+    assert result.returncode != 0, "probe exited 0 although a top-level module of fakebin fails to import"
+    assert "fakebin" in result.stderr, f"probe stderr must name the distribution: {result.stderr!r}"
+    assert "Traceback" not in result.stderr, f"failure must be a clean message, not a traceback: {result.stderr!r}"
+
+
+def test_external_probe_fails_naming_an_entry_point_that_does_not_load(tmp_path: Path) -> None:
+    """Every entry point of the mloda groups is loaded; a failing load names the entry point."""
+    result = _run_probe(["fakebin"], [], _fake_dist(tmp_path, broken_entry_point=True))
+
+    assert result.returncode != 0, "probe exited 0 although the fakebin entry point fails to load"
+    assert "fakebin" in result.stderr, f"probe stderr must name the entry point: {result.stderr!r}"
+    assert "Traceback" not in result.stderr, f"failure must be a clean message, not a traceback: {result.stderr!r}"
+
+
+def test_external_probe_fails_for_a_distribution_mapping_to_no_module(tmp_path: Path) -> None:
+    """A distribution that is installed but owns no top-level module is reported by name."""
+    env = _fake_dist(tmp_path)
+    (tmp_path / "fakebin-0.1.dist-info" / "top_level.txt").write_text("")
+    result = _run_probe(["fakebin"], [], env)
+
+    assert result.returncode != 0 and "fakebin" in result.stderr, result.stderr
 
 
 @pytest.mark.parametrize("env_name", _TOX_PUBLISHED_ENVS)
