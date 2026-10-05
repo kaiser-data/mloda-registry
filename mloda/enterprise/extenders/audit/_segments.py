@@ -9,10 +9,12 @@ from collections import Counter
 from collections.abc import Container, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, Protocol
 
 from mloda.enterprise.extenders.audit._core import (
+    _GENESIS_KIND,
     HeadAnchor,
     LogCoverage,
     ManifestVerificationError,
@@ -41,6 +43,7 @@ from mloda.enterprise.extenders.audit._records import (
     _canonical_json,
     _is_blank,
     _open_locked,
+    _parse_event_time,
 )
 from mloda.enterprise.extenders.audit._seal_index import (
     _indexed_archive,
@@ -101,8 +104,12 @@ def _sealed_in_archives(manifest_path: str | Path, run_id: str, index_path: str 
     return any(_scan_for_run(path, run_id) for _, path in reversed(_archived_segments(manifest_path)))
 
 
+class _InterruptedRotationError(ValueError):
+    """A live file is still the same file as its newest archive."""
+
+
 def _refuse_interrupted_rotation(manifest_path: str | Path, audit_path: str | Path | None = None) -> None:
-    """Raise ValueError when a live file is still the same file as its newest archive (an interrupted rotation)."""
+    """Raise _InterruptedRotationError when a live file is still the same file as its newest archive."""
     archived = _archived_segments(manifest_path)
     if not archived:
         return
@@ -112,7 +119,7 @@ def _refuse_interrupted_rotation(manifest_path: str | Path, audit_path: str | Pa
         pairs.append((audit_path, _segment_path(audit_path, number)))
     for live, archive in pairs:
         if _same_file(live, archive):
-            raise ValueError(
+            raise _InterruptedRotationError(
                 f"{live} is linked to an archived segment: finish the interrupted rotation with rotate_ndjson_segment"
             )
 
@@ -240,9 +247,22 @@ def _stage_genesis(manifest_path: str | Path, genesis: Mapping[str, Any]) -> str
     return temp
 
 
+class _ByteSink(Protocol):
+    def write(self, data: bytes, /) -> int: ...
+
+
+class _ByteCounter:
+    def __init__(self) -> None:
+        self.count = 0
+
+    def write(self, data: bytes, /) -> int:
+        self.count += len(data)
+        return len(data)
+
+
 def _carry_pending(
     audit_path: str | Path,
-    out: IO[bytes],
+    out: _ByteSink,
     start: int,
     skip: Container[str],
     refuse: Container[str],
@@ -307,6 +327,13 @@ def _swap_in(temp: str, live: str | Path) -> None:
     _fsync(Path(live).parent)
 
 
+def _genesis_older_than(genesis: Mapping[str, Any], min_age: timedelta) -> bool:
+    """Whether `genesis` is a genesis entry created at least `min_age` ago."""
+    if genesis.get("kind") != _GENESIS_KIND:
+        return False
+    return datetime.now(timezone.utc) - _parse_event_time(genesis["created_at"]) >= min_age
+
+
 def rotate_ndjson_segment(
     audit_path: str | Path,
     manifest_path: str | Path,
@@ -323,6 +350,35 @@ def rotate_ndjson_segment(
     unsealed runs are carried over. Safe against NdjsonAuditSink writers only; a crash mid-rotation blocks sealing
     until it runs again. Symlinked live paths are refused. Run it as the account that writes the logs: the new live
     files are created by the rotating process."""
+    rotated = _rotate(
+        audit_path,
+        manifest_path,
+        signer=signer,
+        log_id=log_id,
+        previous_signers=previous_signers,
+        expected_head=expected_head,
+        anchored_heads=anchored_heads,
+        head_anchor=head_anchor,
+    )
+    assert rotated is not None
+    return rotated
+
+
+def _rotate(
+    audit_path: str | Path,
+    manifest_path: str | Path,
+    *,
+    signer: ManifestSigner,
+    log_id: str,
+    previous_signers: Iterable[ManifestSigner] = (),
+    expected_head: str | None = None,
+    anchored_heads: Iterable[str] = (),
+    head_anchor: HeadAnchor | None = None,
+    min_archived_bytes: int | None = None,
+    min_age: timedelta | None = None,
+) -> dict[str, Any] | None:
+    """rotate_ndjson_segment, or None when a given threshold is not met (checked under the manifest lock; an
+    interrupted rotation is always finished)."""
     signers = _signer_map(signer, previous_signers)
     _reject_aliased_paths(audit_path=audit_path, manifest_path=manifest_path)
     if log_id is None:
@@ -341,6 +397,7 @@ def rotate_ndjson_segment(
         "log_id": log_id,
         "anchors": anchors,
     }
+    thresholds = min_archived_bytes is not None or min_age is not None
     with _flock(manifest_path, exclusive=True):
         archived = _archived_segments(manifest_path)
         if archived and os.stat(manifest_path).st_nlink > 1 and _same_file(manifest_path, archived[-1][1]):
@@ -352,6 +409,7 @@ def rotate_ndjson_segment(
                     _unlink_durably(audit_archive)
                 _unlink_durably(newest)
                 archived.pop()
+                thresholds = False
             else:
                 state = _outgoing_state(newest, _read_manifests(newest), None, **check)
                 genesis = _genesis_entry(signer, log_id, state.head)
@@ -367,12 +425,22 @@ def rotate_ndjson_segment(
                     raise
                 return genesis
         manifests = _read_manifests(manifest_path)
+        age_due = bool(thresholds and min_age is not None and manifests and _genesis_older_than(manifests[0], min_age))
+        if thresholds and not age_due and min_archived_bytes is None:
+            return None
         sealed_here = {m["run_id"] for m in manifests if isinstance(m.get("run_id"), str)}
         number = archived[-1][0] + 1 if archived else 1
         manifest_archive, audit_archive = _segment_path(manifest_path, number), _segment_path(audit_path, number)
         if os.path.lexists(manifest_archive) or os.path.lexists(audit_archive):
             raise ValueError(f"archive {manifest_archive} or {audit_archive} already exists")
         skip = sealed_here | _archived_sealed_ids(manifest_path)
+        if thresholds and not age_due and min_archived_bytes is not None:
+            counter = _ByteCounter()
+            counted = 0
+            with suppress(FileNotFoundError):
+                counted = _carry_pending(audit_path, counter, 0, skip, ())
+            if counted - counter.count < min_archived_bytes:
+                return None
         temps: list[str] = []
         with ExitStack() as held:
             try:
