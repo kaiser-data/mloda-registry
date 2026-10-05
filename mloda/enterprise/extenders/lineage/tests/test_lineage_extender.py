@@ -342,7 +342,7 @@ def _run(
 ) -> None:
     mloda.run_all(
         list(features),
-        compute_frameworks={PyArrowTable},
+        compute_frameworks=[PyArrowTable],
         plugin_collector=PluginCollector.enabled_feature_groups({_Root, *feature_groups}),
         function_extender={extender},
     )
@@ -1786,6 +1786,34 @@ class TestLineageFacetsRunFacet:
             LineageFacetsExtender(client=client)(lambda: None)
 
         assert all(_run_facet(event).pluginVersion is None for event in transport.events)
+
+    def test_unresolved_version_and_framework_are_unknown_never_the_string_none(
+        self, ol_capture: tuple[OpenLineageClient, RecordingTransport]
+    ) -> None:
+        client, transport = ol_capture
+
+        extender = LineageFacetsExtender(client=client)
+        with make_hook_context(
+            feature_group_class=None, feature_group_version=None, compute_framework_name=None
+        ).activate():
+            extender(lambda: None)
+        validator_context = make_hook_context(
+            hook=ExtenderHook.VALIDATE_INPUT_FEATURE,
+            feature_group_class=None,
+            feature_group_version=None,
+            compute_framework_name=None,
+            feature_names=("x",),
+        )
+        with validator_context.activate():
+            extender(_PassingValidators.validate_input_features, None, FeatureSet())
+
+        assert transport.events
+        for event in _calculate_run_events(transport.events):
+            facet = _run_facet(event)
+            assert (facet.featureGroupVersion, facet.computeFramework) == ("unknown", "unknown")
+        for event in transport.events:
+            assert "None" not in Serde.to_json(event)
+            assert "None" not in event.job.name
 
     def test_schema_url_is_a_stable_https_url_of_the_module(self) -> None:
         url = MlodaRunFacet._get_schema()

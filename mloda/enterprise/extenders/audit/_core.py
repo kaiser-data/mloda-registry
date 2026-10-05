@@ -153,12 +153,13 @@ def seal_run(
     previous_manifest_hash: str | None = None,
     sealed_late: bool = True,
 ) -> dict[str, Any]:
+    """Seal `records` as run `run_id`; a record without a run_id is matched by its plan_id."""
     records = list(records)
     if not isinstance(run_id, str) or not run_id.strip():
         raise ValueError("seal_run run_id must be a non-blank string")
     if not records:
         raise ValueError(f"seal_run got no records for run_id {run_id!r}")
-    if any(record.get("run_id") != run_id for record in records):
+    if any(_attributed_id(record) != run_id for record in records):
         raise ValueError(f"seal_run got a record that does not belong to run_id {run_id!r}")
     return _seal(
         run_id,
@@ -479,8 +480,14 @@ class _AuditScan:
         self.end += len(line) + 1
 
 
-def _record_run_id(record: Mapping[str, Any]) -> str | None:
+def _attributed_id(record: Mapping[str, Any]) -> Any:
+    """The run_id of a record, else its plan_id (a plan-time deny record has no run_id)."""
     run_id = record.get("run_id")
+    return run_id if run_id is not None else record.get("plan_id")
+
+
+def _record_run_id(record: Mapping[str, Any]) -> str | None:
+    run_id = _attributed_id(record)
     if run_id is not None and not isinstance(run_id, str):
         raise ManifestVerificationError(f"audit record run_id {run_id!r} is neither a string nor null")
     return run_id

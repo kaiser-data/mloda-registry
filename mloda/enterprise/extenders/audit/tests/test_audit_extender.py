@@ -24,7 +24,15 @@ from unittest.mock import Mock, patch
 
 import pytest
 from mloda.provider import BaseInputData
-from mloda.steward import CompositeExtender, Extender, ExtenderHook, HookContext, verified_context
+from mloda.steward import (
+    CompositeExtender,
+    Extender,
+    ExtenderHook,
+    HookContext,
+    LifecycleOutcome,
+    RunContext,
+    verified_context,
+)
 from mloda.user import ParallelizationMode
 from mloda_plugins.feature_group.input_data.read_file_feature import ReadFileFeature
 
@@ -119,6 +127,7 @@ _EXPECTED_RECORD_KEYS = {
     "record_version",
     "event_time",
     "run_id",
+    "plan_id",
     "tenant_id",
     "project_id",
     "principal",
@@ -150,6 +159,7 @@ _POLICY_VERSION = "policy-2026-09-rev-3"
 # Sealing (AuditExtender.on_run_complete) fixtures: deterministic keys, never used for anything but these tests.
 _SEALING_KEY = b"k" * 32
 _SEALING_KEY_B = b"o" * 32
+_SUCCEEDED = LifecycleOutcome(status="succeeded")
 
 
 def _hmac_signer(key_id: str = "seal-key-1", key: bytes = _SEALING_KEY) -> HmacSha256Signer:
@@ -190,7 +200,7 @@ def _extender_with_run_1_sealed(
     extender = make(
         NdjsonAuditSink(audit_path), audit_path=audit_path, manifest_path=manifest_path, signer=signer, **kwargs
     )
-    extender.on_run_complete("run-1")
+    extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
     return extender, audit_path
 
 
@@ -244,7 +254,7 @@ def _rotated_after_run_1(tmp_path: Path, auto: bool = False, **kwargs: Any) -> t
         **extra,
         **kwargs,
     )
-    extender.on_run_complete("run-1")
+    extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
     if not auto:
         rotate_ndjson_segment(audit_path, manifest_path, signer=_hmac_signer(), log_id="log-a")
     return extender, audit_path, manifest_path
@@ -1030,6 +1040,7 @@ class TestAuditExtenderRecord:
             project_id="project-1",
             principal="svc-1",
             run_id="run-123",
+            plan_id="plan-456",
         )
 
         with context.activate():
@@ -1046,6 +1057,7 @@ class TestAuditExtenderRecord:
         assert record["project_id"] == "project-1"
         assert record["principal"] == "svc-1"
         assert record["run_id"] == "run-123"
+        assert record["plan_id"] == "plan-456"
         assert record["hook"] == ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE.name
 
     def test_input_features_none_stays_none(self) -> None:
@@ -1245,6 +1257,40 @@ class TestAuditExtenderFailClosed:
         assert call.calls == 1
         assert sink.records == []
 
+    def test_on_run_start_without_the_tenant_refuses_and_writes_one_deny_record(self) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink, fail_closed=True)
+        run = RunContext(run_id="run-1", plan_id="plan-1", project_id="p", principal="svc")
+
+        with pytest.raises(IdentityRequiredError):
+            extender.on_run_start(run, Mock(plan_id="plan-1"), ())
+
+        assert len(sink.records) == 1
+        record = sink.records[0]
+        assert record["hook"] == "RUN_START"
+        assert record["decision"] == "deny"
+        assert record["status"] == "error"
+        assert record["deny_reason"] == "missing_tenant_id"
+        assert record["run_id"] == "run-1"
+        assert record["plan_id"] == "plan-1"
+
+    def test_on_run_start_with_the_identity_present_allows_and_writes_nothing(self) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink, fail_closed=True)
+        run = RunContext(run_id="run-1", plan_id="plan-1", tenant_id="t", project_id="p", principal="svc")
+
+        extender.on_run_start(run, Mock(plan_id="plan-1"), ())
+
+        assert sink.records == []
+
+    def test_on_run_start_without_fail_closed_is_a_no_op(self) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink, fail_closed=False)
+
+        extender.on_run_start(RunContext(run_id="run-1", plan_id="plan-1"), Mock(plan_id="plan-1"), ())
+
+        assert sink.records == []
+
     @pytest.mark.parametrize(
         "hook", [ExtenderHook.FEATURE_GROUP_MATCHED, ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE], ids=lambda h: h.name
     )
@@ -1290,7 +1336,7 @@ class TestAuditExtenderClose:
 
 
 class TestAuditExtenderSealing:
-    """on_run_complete(run_id) auto-seals a finished run when audit_path/manifest_path/signer are configured;
+    """on_run_complete(run, outcome) auto-seals a finished run when audit_path/manifest_path/signer are configured;
     otherwise (or with run_id=None) it is a no-op. Direct construction and direct on_run_complete calls, no
     mloda.run_all: the seal machinery itself is exercised end-to-end in the run manifest test modules."""
 
@@ -1301,11 +1347,22 @@ class TestAuditExtenderSealing:
         _append_records(audit_path, [_minimal_audit_record("run-1")])
         extender = AuditExtender(sink=sink, audit_path=audit_path, manifest_path=manifest_path, signer=_hmac_signer())
 
-        extender.on_run_complete(None)
+        extender.on_run_complete(RunContext(run_id=None), _SUCCEEDED)
 
         assert not manifest_path.exists()
 
-    def test_closes_the_sink_before_sealing_so_a_buffered_record_is_included(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            LifecycleOutcome(status="succeeded"),
+            LifecycleOutcome(status="failed", error_type="RuntimeError"),
+            LifecycleOutcome(status="cancelled"),
+        ],
+        ids=["succeeded", "failed", "cancelled"],
+    )
+    def test_closes_the_sink_before_sealing_so_a_buffered_record_is_included(
+        self, tmp_path: Path, outcome: LifecycleOutcome
+    ) -> None:
         audit_path = tmp_path / "audit.ndjson"
         manifest_path = tmp_path / "manifest.ndjson"
         sink = BufferingNdjsonAuditSink(audit_path)
@@ -1313,7 +1370,7 @@ class TestAuditExtenderSealing:
         assert not audit_path.exists()  # buffered only, proving close() (not something else) puts it on disk
         extender = AuditExtender(sink=sink, audit_path=audit_path, manifest_path=manifest_path, signer=_hmac_signer())
 
-        extender.on_run_complete("run-1")
+        extender.on_run_complete(RunContext(run_id="run-1"), outcome)
 
         assert manifest_path.exists()
         manifest = json.loads(manifest_path.read_text(encoding="utf-8").splitlines()[0])
@@ -1331,7 +1388,7 @@ class TestAuditExtenderSealing:
         )
 
         with caplog.at_level(logging.WARNING):
-            extender.on_run_complete("run-never-wrote-anything")  # must not raise
+            extender.on_run_complete(RunContext(run_id="run-never-wrote-anything"), _SUCCEEDED)  # must not raise
 
         assert not manifest_path.exists()
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -1348,7 +1405,7 @@ class TestAuditExtenderSealing:
         )
 
         with caplog.at_level(logging.WARNING):
-            extender.on_run_complete("run-missing")  # must not raise
+            extender.on_run_complete(RunContext(run_id="run-missing"), _SUCCEEDED)  # must not raise
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert any("run-missing" in r.getMessage() and str(audit_path) in r.getMessage() for r in warnings)
@@ -1372,7 +1429,7 @@ class TestAuditExtenderSealing:
                 refuser(_CountingCall())
 
         with caplog.at_level(logging.INFO):
-            refuser.on_run_complete("run-1")  # must not raise
+            refuser.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)  # must not raise
 
         assert not any(r.levelno >= logging.ERROR and r.name == audit_extender_module.__name__ for r in caplog.records)
         infos = [r for r in caplog.records if r.levelno == logging.INFO and r.name == audit_extender_module.__name__]
@@ -1389,13 +1446,13 @@ class TestAuditExtenderSealing:
         extender = AuditExtender(
             sink=NdjsonAuditSink(audit_path), audit_path=audit_path, manifest_path=manifest_path, signer=signer
         )
-        extender.on_run_complete("run-1")
+        extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
         # Stands for a record from a writer that cannot be refused, e.g. an AuditExtender without sealing
         # config.
         _append_records(audit_path, [_minimal_audit_record("run-1")])
 
         with caplog.at_level(logging.ERROR):
-            extender.on_run_complete("run-1")  # must not raise
+            extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)  # must not raise
 
         errors = [r for r in caplog.records if r.levelno == logging.ERROR]
         assert any(
@@ -1420,7 +1477,7 @@ class TestAuditExtenderSealing:
             audit_file.write(b'{"run_id": "run-1", "comp')
 
         with caplog.at_level(logging.ERROR):
-            extender.on_run_complete("run-1")  # must not raise
+            extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)  # must not raise
 
         errors = [r for r in caplog.records if r.levelno == logging.ERROR and r.name == audit_extender_module.__name__]
         assert any("run-1" in r.getMessage() for r in errors)
@@ -1437,7 +1494,7 @@ class TestAuditExtenderSealing:
         audit_path.mkdir()
 
         with caplog.at_level(logging.ERROR):
-            extender.on_run_complete("run-1")  # must not raise
+            extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)  # must not raise
 
         errors = [r for r in caplog.records if r.levelno == logging.ERROR and r.name == audit_extender_module.__name__]
         assert any("run-1" in r.getMessage() for r in errors)
@@ -1461,7 +1518,7 @@ class TestAuditExtenderSealing:
         )
 
         with pytest.raises(ManifestVerificationError):
-            extender.on_run_complete("run-2")
+            extender.on_run_complete(RunContext(run_id="run-2"), _SUCCEEDED)
 
     def test_pickled_copy_drops_the_signer_and_previous_signers(self, tmp_path: Path) -> None:
         audit_path = tmp_path / "audit.ndjson"
@@ -1490,11 +1547,13 @@ class TestAuditExtenderSealing:
         )
         copy = pickle.loads(pickle.dumps(extender))  # nosec
 
-        copy.on_run_complete("run-1")  # must not raise, and must not seal: the copy has no signer
+        copy.on_run_complete(
+            RunContext(run_id="run-1"), _SUCCEEDED
+        )  # must not raise, and must not seal: the copy has no signer
 
         assert not manifest_path.exists()
 
-        extender.on_run_complete("run-1")  # the original still seals
+        extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)  # the original still seals
 
         assert manifest_path.exists()
 
@@ -1510,7 +1569,9 @@ class TestAuditExtenderSealing:
         copy = pickle.loads(pickle.dumps(extender))  # nosec
 
         with caplog.at_level(logging.WARNING):
-            copy.on_run_complete("run-1")  # must not raise, and must not seal: the copy has no signer
+            copy.on_run_complete(
+                RunContext(run_id="run-1"), _SUCCEEDED
+            )  # must not raise, and must not seal: the copy has no signer
 
         assert not manifest_path.exists()
         matching = [
@@ -1522,7 +1583,7 @@ class TestAuditExtenderSealing:
 
         caplog.clear()
         with caplog.at_level(logging.WARNING):
-            copy.on_run_complete("run-1")  # same copy again: must not warn a second time
+            copy.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)  # same copy again: must not warn a second time
 
         assert not manifest_path.exists()
         assert not any(re.search(r"pickl|copi", r.getMessage(), re.IGNORECASE) for r in caplog.records)
@@ -1536,7 +1597,7 @@ class TestAuditExtenderSealing:
         extender = AuditExtender(sink=sink, audit_path=audit_path, manifest_path=manifest_path, signer=_hmac_signer())
 
         with pytest.raises(RuntimeError, match="flush boom"):
-            extender.on_run_complete("run-1")
+            extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
 
         assert not manifest_path.exists()
 
@@ -1572,7 +1633,9 @@ class TestAuditExtenderSealing:
 
         assert copy._head_anchor is None
         assert copy._seal_failure_policy == "log"
-        copy.on_run_complete("run-1")  # the copy never seals and never touches the anchor
+        copy.on_run_complete(
+            RunContext(run_id="run-1"), _SUCCEEDED
+        )  # the copy never seals and never touches the anchor
         assert not manifest_path.exists()
         assert copy.seal_failures == 0
 
@@ -1585,12 +1648,12 @@ class TestAuditExtenderSealing:
         for run_id in run_ids:
             with make_hook_context(run_id=run_id, tenant_id=_TENANT).activate():
                 extender(_CountingCall())
-            extender.on_run_complete(run_id)
+            extender.on_run_complete(RunContext(run_id=run_id), _SUCCEEDED)
 
         with make_hook_context(run_id="run-alpha", tenant_id=_TENANT).activate():
             with pytest.raises(SealedRunRefusedError):
                 extender(_CountingCall())
-        extender.on_run_complete("run-alpha")
+        extender.on_run_complete(RunContext(run_id="run-alpha"), _SUCCEEDED)
 
         assert _holds_none_of(extender, run_ids)
         pickled = pickle.dumps(extender)  # nosec
@@ -1637,7 +1700,9 @@ class TestAuditExtenderSealing:
         extender, audit_path, manifest_path = _rotated_after_run_1(tmp_path, auto=rotation == "auto", **extra)
         with make_hook_context(run_id="run-2", tenant_id=_TENANT).activate():
             extender(_CountingCall())
-        extender.on_run_complete("run-2")  # seals in the new segment, so the index is rebuilt
+        extender.on_run_complete(
+            RunContext(run_id="run-2"), _SUCCEEDED
+        )  # seals in the new segment, so the index is rebuilt
         assert extender.seal_failures == 0
         if rotation == "auto":  # the run-2 seal rotated again
             archived = manifest_path.with_name(manifest_path.name + ".000002")
@@ -1660,10 +1725,15 @@ class TestAuditExtenderSealing:
         second = _second_extender_over_same_sealing_config(audit_path, manifest_path, _hmac_signer(), log_id="log-a")
 
         with caplog.at_level(logging.INFO):
-            second.on_run_complete("run-1")
+            second.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
 
         assert second.seal_failures == 0
-        assert any(r.levelno == logging.INFO and "already sealed" in r.getMessage() for r in caplog.records)
+        assert any(
+            r.levelno == logging.INFO
+            and "already sealed" in r.getMessage()
+            and "was not sealed again" in r.getMessage()
+            for r in caplog.records
+        )
 
     def test_an_auto_seal_after_a_rotation_succeeds_while_the_anchor_still_holds_the_old_head(
         self, tmp_path: Path
@@ -1675,7 +1745,7 @@ class TestAuditExtenderSealing:
 
         with make_hook_context(run_id="run-2", tenant_id=_TENANT).activate():
             extender(_CountingCall())
-        extender.on_run_complete("run-2")
+        extender.on_run_complete(RunContext(run_id="run-2"), _SUCCEEDED)
 
         assert extender.seal_failures == 0
         assert json.loads(manifest_path.read_text(encoding="utf-8").splitlines()[-1])["run_id"] == "run-2"
@@ -1753,7 +1823,7 @@ class TestAuditExtenderSealing:
             # whatever it cached for run-1 rather than leave a stale "unsealed" answer behind.
             with make_hook_context(run_id="run-1", tenant_id=_TENANT).activate():
                 instance_c(_CountingCall())
-            instance_c.on_run_complete("run-1")
+            instance_c.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
             assert not audit_path.exists()
         else:
             assert prime == "pickled_after_calculate"
@@ -1875,7 +1945,9 @@ class TestAuditExtenderSealing:
             sink=NdjsonAuditSink(audit_path), audit_path=audit_path, manifest_path=manifest_path, signer=signer
         )
 
-        extender.on_run_complete("run-1")  # nothing was sealed: missing file or no records for run-1
+        extender.on_run_complete(
+            RunContext(run_id="run-1"), _SUCCEEDED
+        )  # nothing was sealed: missing file or no records for run-1
 
         call = _CountingCall()
         with make_hook_context(run_id="run-1", tenant_id=_TENANT).activate():
@@ -1894,7 +1966,9 @@ class TestAuditExtenderSealing:
             sink=NdjsonAuditSink(audit_path), audit_path=audit_path, manifest_path=manifest_path, signer=signer
         )
 
-        extender.on_run_complete("run-1")  # hits the RunAlreadySealedError branch, logged at ERROR
+        extender.on_run_complete(
+            RunContext(run_id="run-1"), _SUCCEEDED
+        )  # hits the RunAlreadySealedError branch, logged at ERROR
 
         before = audit_path.read_bytes()
         call = _CountingCall()
@@ -1922,7 +1996,7 @@ class TestAuditExtenderSealing:
         sink = InMemoryAuditSink()
         extender = AuditExtender(sink=sink)
 
-        extender.on_run_complete("run-1")  # a no-op: no sealing config
+        extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)  # a no-op: no sealing config
 
         call = _CountingCall()
         with make_hook_context(run_id="run-1", tenant_id=_TENANT).activate():
@@ -1996,7 +2070,7 @@ class TestAuditExtenderSealing:
         extender = self._failing_seal_extender(tmp_path)
         _, manifest_path = _sealing_config(tmp_path)
 
-        extender.on_run_complete("run-1")
+        extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
 
         manifest = json.loads(manifest_path.read_text(encoding="utf-8").splitlines()[0])
         assert manifest["sealed_late"] is False
@@ -2007,7 +2081,7 @@ class TestAuditExtenderSealing:
         extender = self._failing_seal_extender(tmp_path, log_id="log-a", head_anchor=anchor)
 
         with patch.object(audit_extender_module, "seal_ndjson_runs", return_value=[]) as seal:
-            extender.on_run_complete("run-1")
+            extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
 
         kwargs = seal.call_args.kwargs
         assert kwargs["sealed_late"] is False
@@ -2021,7 +2095,7 @@ class TestAuditExtenderSealing:
         extender = self._failing_seal_extender(tmp_path, head_anchor=anchor)
 
         with patch.object(audit_extender_module, "seal_ndjson_runs", return_value=[]) as seal:
-            extender.on_run_complete("run-1")
+            extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
 
         assert list(seal.call_args.kwargs.get("anchored_heads", ())) == []
 
@@ -2029,7 +2103,7 @@ class TestAuditExtenderSealing:
         extender, audit_path, manifest_path, anchor = self._anchored_extender(tmp_path, log_id="log-a")
         _append_records(audit_path, [_minimal_audit_record("run-1")])
 
-        extender.on_run_complete("run-1")
+        extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
 
         lines = [json.loads(line) for line in manifest_path.read_text(encoding="utf-8").splitlines()]
         assert [line.get("kind") for line in lines] == ["genesis", None]
@@ -2040,11 +2114,11 @@ class TestAuditExtenderSealing:
     def test_a_second_auto_seal_passes_the_first_anchored_head_and_succeeds(self, tmp_path: Path) -> None:
         extender, audit_path, manifest_path, anchor = self._anchored_extender(tmp_path)
         _append_records(audit_path, [_minimal_audit_record("run-1")])
-        extender.on_run_complete("run-1")
+        extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
         first_head = anchor.latest()
         _append_records(audit_path, [_minimal_audit_record("run-2")])
 
-        extender.on_run_complete("run-2")
+        extender.on_run_complete(RunContext(run_id="run-2"), _SUCCEEDED)
 
         assert anchor.latest() != first_head
         assert extender.seal_failures == 0
@@ -2069,7 +2143,7 @@ class TestAuditExtenderSealing:
             tmp_path, segment_max_bytes=10**9, segment_max_age=timedelta(days=365)
         )
 
-        extender.on_run_complete("run-1")
+        extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
 
         assert extender.seal_failures == 0
         assert json.loads(manifest_path.read_text(encoding="utf-8").splitlines()[-1])["run_id"] == "run-1"
@@ -2079,7 +2153,7 @@ class TestAuditExtenderSealing:
     def test_segment_max_bytes_passed_rotates_after_the_seal_and_anchors_the_new_genesis(self, tmp_path: Path) -> None:
         extender, audit_path, manifest_path, anchor = self._rotating_extender(tmp_path, segment_max_bytes=1)
 
-        extender.on_run_complete("run-1")
+        extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
 
         assert self._archive(audit_path).exists()
         assert self._archive(manifest_path).exists()
@@ -2097,7 +2171,7 @@ class TestAuditExtenderSealing:
         )
         manifest_path.write_bytes(_canonical_json(genesis) + b"\n")
 
-        extender.on_run_complete("run-1")
+        extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
 
         assert extender.seal_failures == 0
         assert self._archive(audit_path).exists()
@@ -2106,7 +2180,7 @@ class TestAuditExtenderSealing:
     def test_segment_max_age_not_passed_on_a_fresh_log_does_not_rotate(self, tmp_path: Path) -> None:
         extender, audit_path, manifest_path, _ = self._rotating_extender(tmp_path, segment_max_age=timedelta(hours=1))
 
-        extender.on_run_complete("run-1")
+        extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
 
         assert extender.seal_failures == 0
         assert not self._archive(audit_path).exists()
@@ -2114,7 +2188,7 @@ class TestAuditExtenderSealing:
 
     def test_no_rotation_when_the_run_was_already_sealed(self, tmp_path: Path) -> None:
         extender, audit_path, manifest_path, _ = self._rotating_extender(tmp_path)
-        extender.on_run_complete("run-1")
+        extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
         rotating = _second_extender_over_same_sealing_config(
             audit_path, manifest_path, _hmac_signer(), log_id="log-a", segment_max_bytes=1
         )
@@ -2122,7 +2196,7 @@ class TestAuditExtenderSealing:
         with make_hook_context(run_id="run-1", tenant_id=_TENANT).activate():
             with pytest.raises(SealedRunRefusedError):
                 rotating(_CountingCall())
-        rotating.on_run_complete("run-1")
+        rotating.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
 
         assert rotating.seal_failures == 0
         assert not self._archive(audit_path).exists()
@@ -2132,7 +2206,7 @@ class TestAuditExtenderSealing:
         extender, audit_path, manifest_path, _ = self._rotating_extender(tmp_path, segment_max_bytes=1)
 
         with patch.object(audit_extender_module, "seal_ndjson_runs", side_effect=RunNotPendingError("none")):
-            extender.on_run_complete("run-1")
+            extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
 
         assert extender.seal_failures == 0
         assert not self._archive(audit_path).exists()
@@ -2143,9 +2217,9 @@ class TestAuditExtenderSealing:
         _append_records(audit_path, [_minimal_audit_record("run-x") for _ in range(20)])
         assert audit_path.stat().st_size > 1000
 
-        extender.on_run_complete("run-1")
+        extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
         _append_records(audit_path, [_minimal_audit_record("run-2")])
-        extender.on_run_complete("run-2")
+        extender.on_run_complete(RunContext(run_id="run-2"), _SUCCEEDED)
 
         assert extender.seal_failures == 0
         assert not self._archive(audit_path).exists()
@@ -2158,7 +2232,7 @@ class TestAuditExtenderSealing:
         _, audit_path, manifest_path, _ = TestAuditExtenderSealing._rotating_extender(tmp_path)
         _append_records(audit_path, [_minimal_audit_record("run-2")])
         sealer = _second_extender_over_same_sealing_config(audit_path, manifest_path, _hmac_signer(), log_id="log-a")
-        sealer.on_run_complete("run-1")
+        sealer.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
         with patch("os.replace", _crash_on_replace(call_number)):
             with pytest.raises(_Crash):
                 rotate_ndjson_segment(audit_path, manifest_path, signer=_hmac_signer(), log_id="log-a")
@@ -2178,7 +2252,7 @@ class TestAuditExtenderSealing:
         )
 
         with caplog.at_level(logging.WARNING):
-            extender.on_run_complete("run-2")
+            extender.on_run_complete(RunContext(run_id="run-2"), _SUCCEEDED)
 
         last = json.loads(manifest_path.read_text(encoding="utf-8").splitlines()[-1])
         warnings = [
@@ -2210,9 +2284,9 @@ class TestAuditExtenderSealing:
             with caplog.at_level(logging.ERROR):
                 if policy == "raise":
                     with pytest.raises(RuntimeError, match="finish boom"):
-                        extender.on_run_complete("run-2")
+                        extender.on_run_complete(RunContext(run_id="run-2"), _SUCCEEDED)
                 else:
-                    extender.on_run_complete("run-2")
+                    extender.on_run_complete(RunContext(run_id="run-2"), _SUCCEEDED)
 
         assert extender.seal_failures == 1
         if policy == "raise":
@@ -2228,7 +2302,7 @@ class TestAuditExtenderSealing:
     def test_not_a_failure_run_not_pending(self, tmp_path: Path, policy: Any) -> None:
         extender = self._failing_seal_extender(tmp_path, seal_failure_policy=policy)
         with patch.object(audit_extender_module, "seal_ndjson_runs", side_effect=RunNotPendingError("none")):
-            extender.on_run_complete("run-1")  # must not raise even under "raise"
+            extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)  # must not raise even under "raise"
 
         assert extender.seal_failures == 0
 
@@ -2243,7 +2317,7 @@ class TestAuditExtenderSealing:
             seal_failure_policy=policy,
         )
 
-        extender.on_run_complete("run-1")
+        extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
 
         assert extender.seal_failures == 0
 
@@ -2251,7 +2325,7 @@ class TestAuditExtenderSealing:
     def test_not_a_failure_already_sealed_run_whose_records_match(self, tmp_path: Path, policy: Any) -> None:
         extender, _ = _extender_with_run_1_sealed(tmp_path, seal_failure_policy=policy)
 
-        extender.on_run_complete("run-1")  # must not raise
+        extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)  # must not raise
 
         assert extender.seal_failures == 0
 
@@ -2262,7 +2336,7 @@ class TestAuditExtenderSealing:
         _append_records(audit_path, [_minimal_audit_record("run-1")])
 
         with caplog.at_level(logging.ERROR):
-            extender.on_run_complete("run-1")
+            extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
 
         assert extender.seal_failures == 1
         assert any(r.levelno == logging.ERROR and "beyond its seal" in r.getMessage() for r in caplog.records)
@@ -2276,7 +2350,7 @@ class TestAuditExtenderSealing:
         )
 
         with patch.object(audit_extender_module, "_check_run_against_seal", side_effect=RuntimeError("check boom")):
-            extender.on_run_complete("run-1")
+            extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
 
         assert extender.seal_failures == 1
         assert [(run_id, type(exc)) for run_id, exc in calls] == [("run-1", RuntimeError)]
@@ -2286,7 +2360,7 @@ class TestAuditExtenderSealing:
         _append_records(audit_path, [_minimal_audit_record("run-1")])
 
         with pytest.raises(ManifestVerificationError):
-            extender.on_run_complete("run-1")
+            extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
 
         assert extender.seal_failures == 1
 
@@ -2297,7 +2371,7 @@ class TestAuditExtenderSealing:
         )
         _append_records(audit_path, [_minimal_audit_record("run-1")])
 
-        extender.on_run_complete("run-1")
+        extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
 
         assert len(calls) == 1
         assert calls[0][0] == "run-1"
@@ -2319,9 +2393,9 @@ class TestAuditExtenderSealing:
         extender = self._failing_seal_extender(tmp_path)
 
         with patch.object(audit_extender_module, "seal_ndjson_runs", side_effect=error):
-            extender.on_run_complete("run-1")
+            extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
             assert extender.seal_failures == 1
-            extender.on_run_complete("run-1")
+            extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
 
         assert extender.seal_failures == 2
 
@@ -2349,7 +2423,7 @@ class TestAuditExtenderSealing:
 
         with patch.object(audit_extender_module, target, side_effect=error):
             with caplog.at_level(logging.ERROR):
-                extender.on_run_complete("run-1")  # must not raise
+                extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)  # must not raise
 
         errors = [r for r in caplog.records if r.levelno == logging.ERROR and r.name == audit_extender_module.__name__]
         assert any(type(error).__name__ in r.getMessage() and "run-1" in r.getMessage() for r in errors)
@@ -2370,7 +2444,7 @@ class TestAuditExtenderSealing:
         boom = RuntimeError("boom")
 
         with patch.object(audit_extender_module, target, side_effect=boom):
-            extender.on_run_complete("run-1")
+            extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
 
         callback.assert_called_once_with("run-1", boom)
         assert extender.seal_failures == 1
@@ -2381,7 +2455,7 @@ class TestAuditExtenderSealing:
 
         with patch.object(audit_extender_module, target, side_effect=RuntimeError("boom")):
             with pytest.raises(RuntimeError, match="boom"):
-                extender.on_run_complete("run-1")
+                extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
 
         assert extender.seal_failures == 1
 
@@ -2392,7 +2466,7 @@ class TestAuditExtenderSealing:
         extender = self._failing_seal_extender(tmp_path, head_anchor=anchor, seal_failure_policy="raise")
 
         with pytest.raises(OSError, match="anchor down"):
-            extender.on_run_complete("run-1")
+            extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
 
         assert extender.seal_failures == 1
 
@@ -2405,15 +2479,16 @@ class TestAuditExtenderSealing:
         )
         _, manifest_path = _sealing_config(tmp_path)
 
-        extender.on_run_complete("run-1")
+        extender.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)
 
         assert extender.seal_failures == 1
         assert [type(exc) for _, exc in calls] == [ManifestVerificationError]
         assert not manifest_path.exists() or manifest_path.read_text(encoding="utf-8") == ""
 
+    @pytest.mark.parametrize("policy", ["callable", "raise"])
     @pytest.mark.parametrize("how", ["truncate", "delete_both"])
     def test_a_rolled_back_or_deleted_manifest_log_is_caught_via_the_anchor_through_run_all(
-        self, tmp_path: Path, how: str
+        self, tmp_path: Path, how: str, policy: str
     ) -> None:
         audit_path, manifest_path = _sealing_config(tmp_path)
         anchor_path = tmp_path / "anchor.ndjson"
@@ -2443,13 +2518,16 @@ class TestAuditExtenderSealing:
 
         failures: list[tuple[str, BaseException]] = []
         with verified_context(tenant_id="tenant-1"):
-            second = fresh(seal_failure_policy=lambda run_id, exc: failures.append((run_id, exc)))
+            second = fresh(
+                seal_failure_policy="raise" if policy == "raise" else lambda run_id, exc: failures.append((run_id, exc))
+            )
             values = run_value_int(second)
 
-        assert values == expected_value_int()  # core contains on_run_complete exceptions
+        assert values == expected_value_int()  # core contains on_run_complete exceptions, even under "raise"
         assert second.seal_failures == 1
-        assert len(failures) == 1
-        assert isinstance(failures[0][1], ManifestVerificationError)
+        if policy == "callable":
+            assert len(failures) == 1
+            assert isinstance(failures[0][1], ManifestVerificationError)
 
     def test_a_pickled_copy_with_an_ndjson_head_anchor_unpickles_and_never_seals(self, tmp_path: Path) -> None:
         extender, audit_path, manifest_path, _ = self._anchored_extender(
@@ -2459,7 +2537,7 @@ class TestAuditExtenderSealing:
 
         copy = pickle.loads(pickle.dumps(extender))  # nosec
 
-        copy.on_run_complete("run-1")  # no signer: skipped, never a failure
+        copy.on_run_complete(RunContext(run_id="run-1"), _SUCCEEDED)  # no signer: skipped, never a failure
         assert not manifest_path.exists()
         assert copy.seal_failures == 0
 
@@ -2585,7 +2663,7 @@ class TestAuditExtenderSealing:
 
         for number in range(prior):
             _append_records(audit_path, [_minimal_audit_record(f"run-{number}")])
-            build().on_run_complete(f"run-{number}")
+            build().on_run_complete(RunContext(run_id=f"run-{number}"), _SUCCEEDED)
         verifications.clear()
 
         parses: list[str] = []
@@ -2612,7 +2690,7 @@ class TestAuditExtenderSealing:
             extender = build()
             with make_hook_context(run_id="run-next", tenant_id=_TENANT).activate():
                 extender(_CountingCall())
-            extender.on_run_complete("run-next")
+            extender.on_run_complete(RunContext(run_id="run-next"), _SUCCEEDED)
         return len(verifications), len(parses), sum(read)
 
     def test_the_whole_auto_seal_costs_the_same_whatever_the_history_with_the_index(
@@ -3351,6 +3429,20 @@ class TestAuditExtenderRunAll:
             assert record["run_id"] is not None
             assert record["hook"] == ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE.name
 
+    @_BOTH_POSTURES
+    def test_run_outside_a_verified_context_inherits_the_plan_time_identity(self, fail_closed: bool) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink, fail_closed=fail_closed)
+
+        with verified_context(tenant_id="tenant-42", project_id="project-7", principal="svc"):
+            session = prepare_value_int(extender)
+        session.run()
+
+        assert sink.records
+        for record in sink.records:
+            assert record["tenant_id"] == "tenant-42"
+            assert record["decision"] == "allow"
+
     @pytest.mark.parametrize(
         "mode", [ParallelizationMode.SYNC, ParallelizationMode.THREADING, ParallelizationMode.MULTIPROCESSING]
     )
@@ -3414,7 +3506,7 @@ class TestAuditExtenderRunAll:
             ParallelizationMode.MULTIPROCESSING,
         ],
     )
-    def test_run_all_fail_closed_refuses_at_calculate_when_identity_is_gone_by_run_time(
+    def test_run_all_fail_closed_refuses_at_run_start_a_run_whose_identity_lost_the_tenant_since_prepare(
         self,
         mode: ParallelizationMode,
         make_gate_extender: Callable[[Any], AuditExtender],
@@ -3436,15 +3528,45 @@ class TestAuditExtenderRunAll:
         with verified_context(tenant_id="t"):
             session = prepare_value_int(gate, counting, parallelization_modes={mode})
 
-        with pytest.raises(IdentityRequiredError):
-            session.run(parallelization_modes={mode}, flight_server=flight_server)
+        # An explicit run-time verified context replaces the plan-time identity; the gate refuses it at run start.
+        with verified_context(project_id="p"):
+            with pytest.raises(IdentityRequiredError):
+                session.run(parallelization_modes={mode}, flight_server=flight_server)
 
-        records = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+        lines = audit_path.read_text(encoding="utf-8").splitlines() if audit_path.exists() else []
+        records = [json.loads(line) for line in lines]
         assert len(records) == 1
         record = records[0]
-        assert record["hook"] == ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE.name
+        assert record["hook"] == "RUN_START"
         assert record["decision"] == "deny"
         assert record["status"] == "error"
+        assert record["run_id"] is not None
         assert counting.calls == 0
         # Marker file covers MULTIPROCESSING: a worker's own `calls` copy would be invisible here.
         assert not marker_path.exists()
+
+    @_BOTH_POSTURES
+    @pytest.mark.parametrize("mode", [ParallelizationMode.SYNC, ParallelizationMode.MULTIPROCESSING])
+    def test_run_all_fail_closed_allows_a_run_that_switches_to_another_tenant_since_prepare(
+        self, mode: ParallelizationMode, fail_closed: bool, tmp_path: Path, request: pytest.FixtureRequest
+    ) -> None:
+        audit_path = tmp_path / "audit.ndjson"
+        # Only MULTIPROCESSING needs the flight_server fixture.
+        flight_server = (
+            request.getfixturevalue("flight_server") if mode == ParallelizationMode.MULTIPROCESSING else None
+        )
+        extender = AuditExtender(sink=NdjsonAuditSink(audit_path), fail_closed=fail_closed)
+
+        with verified_context(tenant_id="tenant-a", project_id="project-7", principal="svc"):
+            session = prepare_value_int(extender, parallelization_modes={mode})
+        with verified_context(tenant_id="tenant-b", project_id="project-7", principal="svc"):
+            results = session.run(parallelization_modes={mode}, flight_server=flight_server)
+
+        values = next(t.to_pydict()["value_int"] for t in results if "value_int" in t.column_names)
+        assert values == expected_value_int()
+        records = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+        calculate = [r for r in records if r["hook"] == ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE.name]
+        assert calculate
+        for record in calculate:
+            assert record["tenant_id"] == "tenant-b"
+            assert record["decision"] == "allow"
