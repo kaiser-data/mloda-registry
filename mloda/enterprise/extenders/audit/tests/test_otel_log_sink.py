@@ -464,7 +464,7 @@ class TestOtelLogAuditSinkMapping:
     ) -> None:
         record = _audit_record(
             fail_closed=True,
-            hook=ExtenderHook.FEATURE_GROUP_MATCHED,
+            hook=ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE,
             tenant_id=None,
             project_id="project-1",
             principal="svc-1",
@@ -479,8 +479,8 @@ class TestOtelLogAuditSinkMapping:
             "mloda.audit.decision": "deny",
             "mloda.audit.deny_reason": "missing_tenant_id",
             "mloda.audit.policy_version": _POLICY_VERSION,
-            "mloda.audit.hook": "FEATURE_GROUP_MATCHED",
-            "mloda.audit.phase": "plan",
+            "mloda.audit.hook": "FEATURE_GROUP_CALCULATE_FEATURE",
+            "mloda.audit.phase": "run",
             "mloda.audit.enforced": True,
             "mloda.run.id": "run-123",
             "mloda.project.id": "project-1",
@@ -633,14 +633,15 @@ class TestOtelLogAuditSinkMapping:
         assert "user.hash" not in attributes
         assert all(value.strip() for value in attributes.values() if isinstance(value, str))
 
-    def test_a_match_time_refusal_with_an_empty_feature_group_class_omits_the_name(
+    def test_a_match_time_refusal_with_an_unresolved_none_feature_group_class_omits_the_name(
         self, log_exporter: InMemoryLogRecordExporter
     ) -> None:
         record = _audit_record(
             fail_closed=True,
             hook=ExtenderHook.FEATURE_GROUP_MATCHED,
-            feature_group_class="",
-            compute_framework_name="",
+            feature_group_class=None,
+            feature_group_version=None,
+            compute_framework_name=None,
         )
 
         log = _write_one(log_exporter, record)
@@ -811,7 +812,12 @@ class TestOtelLogAuditSinkMatchTimeRefusal:
     def test_the_refusal_emits_one_warn_record(self, log_exporter: InMemoryLogRecordExporter) -> None:
         extender = AuditExtender(sink=OtelLogAuditSink(), fail_closed=True)
 
-        with make_hook_context(hook=ExtenderHook.FEATURE_GROUP_MATCHED).activate():
+        with make_hook_context(
+            hook=ExtenderHook.FEATURE_GROUP_MATCHED,
+            feature_group_class=None,
+            feature_group_version=None,
+            compute_framework_name=None,
+        ).activate():
             with pytest.raises(IdentityRequiredError):
                 extender(lambda: None)
 
@@ -858,7 +864,7 @@ class TestOtelLogAuditSinkRealExporter:
     def test_a_deny_record_is_serialised_with_its_reason_feature_names_and_hashed_principal(self) -> None:
         record = _audit_record(
             fail_closed=True,
-            hook=ExtenderHook.FEATURE_GROUP_MATCHED,
+            hook=ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE,
             tenant_id=None,
             project_id="project-1",
             principal=_PRINCIPAL,
@@ -876,9 +882,9 @@ class TestOtelLogAuditSinkRealExporter:
             "mloda.audit.decision": "deny",
             "mloda.audit.deny_reason": "missing_tenant_id",
             "mloda.audit.policy_version": _POLICY_VERSION,
-            "mloda.audit.phase": "plan",
+            "mloda.audit.phase": "run",
             "mloda.audit.enforced": True,
-            "mloda.audit.hook": "FEATURE_GROUP_MATCHED",
+            "mloda.audit.hook": "FEATURE_GROUP_CALCULATE_FEATURE",
             "mloda.run.id": "run-123",
             "mloda.project.id": "project-1",
             "mloda.feature_group.name": "my.module.MyFeatureGroup",
@@ -956,7 +962,12 @@ class TestOtelLogAuditSinkFailureIsolation:
         extender = AuditExtender(sink=OtelLogAuditSink(), fail_closed=True)
 
         with patch.object(SdkLogger, "emit", side_effect=RuntimeError("boom-marker")):
-            with make_hook_context(hook=ExtenderHook.FEATURE_GROUP_MATCHED).activate():
+            with make_hook_context(
+                hook=ExtenderHook.FEATURE_GROUP_MATCHED,
+                feature_group_class=None,
+                feature_group_version=None,
+                compute_framework_name=None,
+            ).activate():
                 with pytest.raises(IdentityRequiredError):
                     extender(lambda: None)
 
