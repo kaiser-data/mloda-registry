@@ -1,8 +1,10 @@
 """Dependency-direction guard: community and enterprise plugin packages must never depend on
 ``mloda-testing`` or on a binary wheel (see ``docs/guides/feature-group-patterns/29-binary-backed-
 features.md``), and no runtime module under ``mloda/community/`` or ``mloda/enterprise/`` may import
-``mloda.testing`` at any depth. Mirrors the resolution and TOML-loading style of
-``tests/test_end2end/test_dev_dependencies.py`` and ``tests/test_end2end/test_manifest_resilience.py``.
+``mloda.testing`` at any depth. Enterprise code may use ``mloda.community.extenders.shared`` only
+through public names (no private imports, subclassing, or private attributes). Mirrors the resolution
+and TOML-loading style of ``tests/test_end2end/test_dev_dependencies.py`` and
+``tests/test_end2end/test_manifest_resilience.py``.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import ast
 import importlib
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -311,9 +314,9 @@ def _is_mloda_testing_import(node: ast.AST) -> bool:
     return False
 
 
-def _files_importing_mloda_testing(root_dir: Path) -> list[Path]:
-    """Every .py file under root_dir, outside any tests/ directory, that imports mloda.testing at
-    any depth (module level, function level, or inside a TYPE_CHECKING block)."""
+def _files_with_import(root_dir: Path, predicate: Callable[[ast.AST], bool]) -> list[Path]:
+    """Every .py file under root_dir, outside any tests/ directory, with a node matching predicate
+    at any depth (module level, function level, or inside a TYPE_CHECKING block)."""
     offenders: list[Path] = []
     for py_file in sorted(root_dir.rglob("*.py")):
         rel_path = py_file.relative_to(root_dir)
@@ -321,9 +324,97 @@ def _files_importing_mloda_testing(root_dir: Path) -> list[Path]:
         if "tests" in parts or any(part in _SKIP_DIR_NAMES or part.endswith(".egg-info") for part in parts):
             continue
         tree = ast.parse(py_file.read_text(encoding="utf-8"))
-        if any(_is_mloda_testing_import(node) for node in ast.walk(tree)):
+        if any(predicate(node) for node in ast.walk(tree)):
             offenders.append(rel_path)
     return offenders
+
+
+def _files_importing_mloda_testing(root_dir: Path) -> list[Path]:
+    return _files_with_import(root_dir, _is_mloda_testing_import)
+
+
+_EXTENDERS_SHARED = "mloda.community.extenders.shared"
+
+
+def _is_private_name(name: str) -> bool:
+    return name.startswith("_") and not (name.startswith("__") and name.endswith("__"))
+
+
+def _is_under_extenders_shared(module: str) -> bool:
+    return module == _EXTENDERS_SHARED or module.startswith(_EXTENDERS_SHARED + ".")
+
+
+def _names_bound_from_extenders_shared(tree: ast.AST) -> set[str]:
+    """Local names bound by imports from (or of) the extenders-shared package."""
+    bound: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module is not None:
+            for alias in node.names:
+                if _is_under_extenders_shared(node.module) or (node.module + "." + alias.name == _EXTENDERS_SHARED):
+                    bound.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            bound.update(
+                alias.asname for alias in node.names if alias.asname and _is_under_extenders_shared(alias.name)
+            )
+    return bound
+
+
+def _root_name(node: ast.expr) -> str | None:
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _rides_on_shared_private_seams(tree: ast.AST) -> bool:
+    """True if a class subclasses a shared name, or code reads a private attribute of a shared name."""
+    bound = _names_bound_from_extenders_shared(tree)
+    if not bound:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and any(_root_name(base) in bound for base in node.bases):
+            return True
+        if (
+            isinstance(node, ast.Attribute)
+            and _is_private_name(node.attr)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in bound
+        ):
+            return True
+    return False
+
+
+def _uses_extenders_shared_privately(node: ast.AST) -> bool:
+    """True for a private import from extenders-shared, or (on a Module) subclassing or private attribute access."""
+    if isinstance(node, ast.Module):
+        return _rides_on_shared_private_seams(node)
+    if isinstance(node, ast.Import):
+        return any(
+            (alias.name == _EXTENDERS_SHARED or alias.name.startswith(_EXTENDERS_SHARED + "."))
+            and any(_is_private_name(segment) for segment in alias.name.split("."))
+            for alias in node.names
+        )
+    if isinstance(node, ast.ImportFrom) and node.module is not None:
+        if node.module != _EXTENDERS_SHARED and not node.module.startswith(_EXTENDERS_SHARED + "."):
+            return False
+        return any(_is_private_name(segment) for segment in node.module.split(".")) or any(
+            _is_private_name(alias.name) for alias in node.names
+        )
+    return False
+
+
+def test_enterprise_runtime_code_uses_extenders_shared_only_through_public_names() -> None:
+    root_dir = _REPO_ROOT / "mloda" / "enterprise"
+    assert root_dir.is_dir(), f"expected {root_dir} to exist"
+    offenders = [
+        f"mloda/enterprise/{p.as_posix()}" for p in _files_with_import(root_dir, _uses_extenders_shared_privately)
+    ]
+    assert not offenders, (
+        "enterprise runtime code relies on private mloda-community-extenders-shared seams (private import, "
+        "subclassing a shared class, or a private attribute of a shared name). Either make the name public in "
+        "extenders-shared, or pin mloda-community-extenders-shared~={version} and accept that this caps the "
+        "mloda-community bundle at enterprise's minor (see docs/packaging.md#sibling-dependency-floors): "
+        f"{offenders}"
+    )
 
 
 def test_no_community_or_enterprise_runtime_file_imports_mloda_testing() -> None:
@@ -359,3 +450,48 @@ def test_walker_ignores_import_inside_a_tests_directory(tmp_path: Path) -> None:
     tests_dir.mkdir()
     _write(tests_dir / "test_m.py", "from mloda.testing.base import FeatureGroupTestBase\n")
     assert _files_importing_mloda_testing(tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    ("body", "flagged"),
+    [
+        pytest.param("from mloda.community.extenders.shared.teardown import _force_flush\n", True, id="private-name"),
+        pytest.param("from mloda.community.extenders.shared._internal import force_flush\n", True, id="private-module"),
+        pytest.param("import mloda.community.extenders.shared._internal\n", True, id="private-plain-import"),
+        pytest.param("from mloda.community.extenders.shared.teardown import force_flush\n", False, id="public-name"),
+        pytest.param(
+            "from mloda.community.extenders.shared.open_invocations import OpenInvocationStack\n"
+            "class S(OpenInvocationStack):\n    pass\n",
+            True,
+            id="subclass-imported-class",
+        ),
+        pytest.param(
+            "from mloda.community.extenders import shared\nclass S(shared.open_invocations.OpenInvocationStack):\n"
+            "    pass\n",
+            True,
+            id="subclass-via-module-alias",
+        ),
+        pytest.param(
+            "from mloda.community.extenders.shared import teardown\nteardown._x\n",
+            True,
+            id="private-attribute-of-shared-module",
+        ),
+        pytest.param("from mloda.community.extenders.shared import __version__\n", False, id="dunder-import"),
+        pytest.param("from mloda.community.extenders.shared_other._x import y\n", False, id="prefix-collision"),
+        pytest.param(
+            "from mloda.community.extenders.openlineage.openlineage_extender import _x\n",
+            False,
+            id="unrelated-private-import",
+        ),
+        pytest.param(
+            "from mloda.community.extenders.shared.open_invocations import OpenInvocationStack\n"
+            "s = OpenInvocationStack()\n",
+            False,
+            id="plain-instantiation",
+        ),
+    ],
+)
+def test_extenders_shared_private_use_predicate(tmp_path: Path, body: str, flagged: bool) -> None:
+    _write(tmp_path / "m.py", body)
+    expected = [Path("m.py")] if flagged else []
+    assert _files_with_import(tmp_path, _uses_extenders_shared_privately) == expected
