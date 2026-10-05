@@ -1848,6 +1848,68 @@ class TestOpenLineageExtenderInputDataLoadCorrelation:
             for secret in secrets:
                 assert secret not in serialized
 
+    @pytest.mark.parametrize(
+        ("is_fallback", "expect_facet"),
+        [(True, True), (False, False), (None, False)],
+        ids=["fallback", "real", "unset"],
+    )
+    def test_data_access_facet_marks_only_fallback_identities(
+        self, ol_capture: tuple[OpenLineageClient, RecordingTransport], is_fallback: bool | None, expect_facet: bool
+    ) -> None:
+        import json
+
+        from openlineage.client.serde import Serde
+
+        client, transport = ol_capture
+        extender = OpenLineageExtender(client=client)
+        inner_context = make_hook_context(
+            hook=ExtenderHook.INPUT_DATA_LOAD, data_access_identity="str", data_access_identity_is_fallback=is_fallback
+        )
+
+        def outer_func() -> str:
+            with inner_context.activate():
+                extender(lambda *_: "loaded-data", "host=db")
+            return "calculate-result"
+
+        with make_hook_context().activate():
+            extender(outer_func)
+
+        payload = json.loads(Serde.to_json(transport.events[1]))
+        assert len(payload["inputs"]) == 1
+        facets = payload["inputs"][0]["facets"]
+        if expect_facet:
+            assert facets["mlodaDataAccess"]["identityIsFallback"] is True
+            assert facets["mlodaDataAccess"]["_producer"] == extender.producer
+        else:
+            assert "mlodaDataAccess" not in facets
+
+    @pytest.mark.parametrize("flags", [(False, True), (True, False)], ids=["real_then_fallback", "fallback_then_real"])
+    def test_any_fallback_load_of_an_identity_marks_the_one_input_dataset(
+        self, ol_capture: tuple[OpenLineageClient, RecordingTransport], flags: tuple[bool, bool]
+    ) -> None:
+        import json
+
+        from openlineage.client.serde import Serde
+
+        client, transport = ol_capture
+        extender = OpenLineageExtender(client=client)
+
+        def outer_func() -> str:
+            for flag in flags:
+                inner_context = make_hook_context(
+                    hook=ExtenderHook.INPUT_DATA_LOAD, data_access_identity="str", data_access_identity_is_fallback=flag
+                )
+                with inner_context.activate():
+                    extender(lambda *_: "loaded-data", "host=db")
+            return "calculate-result"
+
+        with make_hook_context().activate():
+            extender(outer_func)
+
+        payload = json.loads(Serde.to_json(transport.events[1]))
+        assert len(payload["inputs"]) == 1
+        assert payload["inputs"][0]["facets"]["mlodaDataAccess"]["identityIsFallback"] is True
+
     def test_context_identity_none_records_no_input_even_with_a_str_uri_args0(
         self, ol_capture: tuple[OpenLineageClient, RecordingTransport]
     ) -> None:

@@ -42,13 +42,14 @@ from mloda.enterprise.extenders.audit.run_manifest import (
     _check_run_against_seal,
     seal_ndjson_runs,
 )
-from mloda.enterprise.extenders.audit.run_manifest import _is_run_sealed_unverified as _is_run_sealed_unverified
 
 logger = logging.getLogger(__name__)
 
 _ALLOWED_IDENTITY_NAMES = ("tenant_id", "project_id", "principal")
 
-_open_calculates: OpenInvocationStack[list[tuple[str, str | None]]] = OpenInvocationStack("audit_open_calculates")
+_open_calculates: OpenInvocationStack[list[tuple[str, str | None, bool | None]]] = OpenInvocationStack(
+    "audit_open_calculates"
+)
 
 
 class AuditSink(Protocol):
@@ -135,10 +136,6 @@ class IdentityRequiredError(RuntimeError):
     """Raised by AuditExtender(fail_closed=True) when a required identity is missing."""
 
 
-class SealedRunRefusedError(RuntimeError):
-    """Raised by AuditExtender for a call under a run_id already sealed in its manifest log."""
-
-
 def _error_type(exc: BaseException) -> str:
     return f"{type(exc).__module__}.{type(exc).__qualname__}"
 
@@ -157,32 +154,30 @@ class AuditExtender(Extender):
     before the wrapped call, also at FEATURE_GROUP_MATCHED, and runs outermost (priority 0). fail_closed=True
     declares core's never_fall_back, so raise_on_error has no effect on it: the refusal, and a sink
     failure on the refusal path or after a successful call, always propagate. fail_closed is read-only.
-    Records also list the distinct data loads the call attempted, as index-aligned identity and format
-    lists ([] for none; a load without an identity is omitted). The identity is core's data_access_identity,
-    recorded as given, and a sealed log cannot be redacted afterwards. Records carry policy_version (the
-    given value, else a fingerprint of the constructor-supplied gate, which does not track code changes).
+    Records also list the distinct data loads the call attempted, as three index-aligned identity, format and
+    identity-is-fallback lists ([] for none; a load without an identity is omitted). The identity is core's
+    data_access_identity and the third list is core's data_access_identity_is_fallback (True when core fell
+    back to a placeholder, not a dataset id), recorded as given, and a sealed log cannot be redacted afterwards.
+    Records carry policy_version (the given value, else a fingerprint of the constructor-supplied gate, which does
+    not track code changes).
     Keys may be added within record_version 1; an absent key means not recorded. With audit_path,
     manifest_path and signer all given (previous_signers optional), on_run_complete auto-seals the run
-    that just finished, whatever its outcome. An auto-sealing instance, or a pickled copy of one, refuses a
-    calculation with SealedRunRefusedError before writing anything when its run_id is already named in manifest_path
-    or a retained archive of it (an unverified read, once per run per instance or copy, at its first calculation; a
-    seal landing after that first calculation is not seen). Each run() of a prepared session gets a fresh run_id,
-    so a rerun is audited and sealed as its own run; the refusal is a defensive guard for a run_id already sealed. The read is unverified, so a writer to
-    manifest_path can make runs be refused (availability only, it never hides a seal). With raise_on_error=False
-    (fail_closed=False), core instead logs the refusal and runs the call unaudited, as for a sink failure. A manifest
-    read failure is logged at WARNING and the run is audited without the check. An AuditExtender without sealing
-    config cannot check and is never refused.
+    that just finished, whatever its outcome. Each run() of a prepared session gets a fresh run_id, so a rerun
+    is audited and sealed as its own run; a calculation under an already-sealed run_id (only possible by hand)
+    is audited, and when the sink writes to audit_path, on_run_complete counts its record outside the seal as a
+    seal failure (under "raise" that fails the run).
     A fail_closed=True deny record written at plan time is a different, recoverable case: it is refused
     before setup, so on_run_complete never fires for it and it is never auto-sealed at all (not sealed-with-strays).
     A record with no run_id is attributed to its plan_id, so a seal_ndjson_runs sweep seals it under that plan_id
     (target it, not a blanket sweep, while another run may be live; find it via
     verify_ndjson_log_coverage(...).unsealed_lines). Auto-sealing uses the optional log_id and head_anchor (each new
-    head is emitted to it, and its latest head must still be in the log). A seal failure (any sealing or anchor error, or a
-    mismatch with an existing seal) increments the public seal_failures counter and follows seal_failure_policy:
-    "log" (default), "raise", or a callable(run_id, exc). Core contains an exception raised from on_run_complete,
-    so "raise" does not fail the finished run. segment_max_bytes / segment_max_age (need log_id) rotate the segment
-    after an auto-seal once the sealed bytes a rotation would archive reach that size (carried pending runs do not
-    count) or the segment that age; a rotation failure counts in seal_failures and follows seal_failure_policy.
+    head is emitted to it, and its latest head must still be in the log). A seal failure (any sealing or anchor
+    error, or a mismatch with an existing seal) increments the public seal_failures counter and follows seal_failure_policy:
+    "log" (default), "raise", or a callable(run_id, exc). Under "raise" the instance sets core's
+    raise_on_run_complete, so an exception from on_run_complete (a seal failure or any other) fails a run that
+    otherwise succeeded; a failed run keeps its own error and core only logs this one. segment_max_bytes /
+    segment_max_age (need log_id) rotate the segment after an auto-seal once the sealed bytes a rotation would
+    archive reach that size (carried pending runs do not count) or the segment that age; a rotation failure counts in seal_failures and follows seal_failure_policy.
     seal_index_path opts into a rebuildable seal index cache; it needs the sealing config and must not alias
     audit_path, manifest_path or the anchor path."""
 
@@ -305,12 +300,12 @@ class AuditExtender(Extender):
         self._log_id = log_id
         self._head_anchor = head_anchor
         self._seal_failure_policy = seal_failure_policy
+        self.raise_on_run_complete = seal_failure_policy == "raise"
         self._seal_index_path = seal_index_path
         self._segment_max_bytes = segment_max_bytes
         self._segment_max_age = segment_max_age
         self.seal_failures = 0
         self._pickle_drop_warning = WarnOncePerInstance()
-        self._run_sealed: dict[str, bool] = {}
         if fail_closed:
             # Core runs the lowest priority outermost; a lower-priority peer would otherwise run before the gate.
             self.priority = 0
@@ -374,18 +369,16 @@ class AuditExtender(Extender):
         signer (see __getstate__): it warns once per copy instead of raising or sealing anything.
         RunAlreadySealedError is logged at INFO when audit_path's records of the run still match its seal, else it is a seal failure with the reason (a record outside the seal, or a failed check);
         RunNotPendingError is logged at WARNING (recoverable: the run just wrote nothing
-        yet). Neither is raised. The run's cached answer is dropped, so a later call under it re-reads the
-        manifest log. A mismatch with an existing seal and every other exception (including
-        anchor failures) is a seal failure: counted in seal_failures, then handled by seal_failure_policy. With
-        "raise" it propagates; core logs it at ERROR and never fails the run because of it, regardless of
-        raise_on_error/fail_closed. After a seal it made, it rotates the segment when segment_max_bytes /
-        segment_max_age is passed; a rotation failure is a seal failure too (counted and handled by
-        seal_failure_policy; the run stays sealed). With auto-rotation it also finishes an interrupted rotation (logged
+        yet). Neither is raised. A mismatch with an existing seal and every other exception (including
+        anchor failures) is a seal failure: counted in seal_failures, then handled by seal_failure_policy. Under
+        "raise" the instance sets core's raise_on_run_complete, so an exception from here (a seal failure or any
+        other) fails a run that otherwise succeeded; a failed run keeps its own error and core only logs this one.
+        After a seal it made, it rotates the segment when segment_max_bytes / segment_max_age is passed; a rotation
+        failure is a seal failure too (counted and handled by seal_failure_policy; the run stays sealed). With auto-rotation it also finishes an interrupted rotation (logged
         at WARNING) and retries the seal once."""
         run_id = run.run_id
         if run_id is None:
             return
-        self._run_sealed.pop(run_id, None)  # the run is over: a later call re-reads the manifest log
         if self._signer is None:
             if self._audit_path is not None:
                 self._pickle_drop_warning.warn_once(
@@ -542,14 +535,13 @@ class AuditExtender(Extender):
     def __getstate__(self) -> dict[str, Any]:
         """Drops the signer material, head anchor and failure policy so a pickled copy (e.g. into a
         MULTIPROCESSING worker's dispatch payload) carries none: on_run_complete only ever runs in the parent,
-        never in a worker copy, and Ed25519Signer holds non-picklable cryptography key objects besides. Also resets the per-run
-        cache, so the copy carries no run_ids and re-checks the manifest log."""
+        never in a worker copy, and Ed25519Signer holds non-picklable cryptography key objects besides.
+        raise_on_run_complete is kept: harmless, since copies never get on_run_complete."""
         state = dict(self.__dict__)
         state["_signer"] = None
         state["_previous_signers"] = ()
         state["_head_anchor"] = None
         state["_seal_failure_policy"] = "log"
-        state["_run_sealed"] = {}
         return state
 
     def wraps(self) -> set[ExtenderHook]:
@@ -571,13 +563,6 @@ class AuditExtender(Extender):
             self._note_load(context)
             return func(*args, **kwargs)
 
-        # MATCHED runs at plan time with run_id None (plan_id set), so it is never checked and never caches.
-        if context.hook is ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE and self._found_sealed(context.run_id):
-            raise SealedRunRefusedError(
-                f"AuditExtender refused the call: run_id {context.run_id!r} is already sealed in the "
-                "manifest log; prepare a new session to run again"
-            )
-
         if self.fail_closed:
             missing = self._missing_identity(context)
             if missing:
@@ -590,7 +575,7 @@ class AuditExtender(Extender):
             if context.hook is ExtenderHook.FEATURE_GROUP_MATCHED:
                 return func(*args, **kwargs)
 
-        loads: list[tuple[str, str | None]] = []
+        loads: list[tuple[str, str | None, bool | None]] = []
         try:
             with _open_calculates.open(self, loads):
                 result = func(*args, **kwargs)
@@ -622,37 +607,20 @@ class AuditExtender(Extender):
         identity = context.data_access_identity
         if identity is None:
             return
-        entry = (identity, context.data_access_format)
+        entry = (identity, context.data_access_format, context.data_access_identity_is_fallback)
         if entry not in loads:
             loads.append(entry)
-
-    def _found_sealed(self, run_id: str | None) -> bool:
-        """Whether run_id is sealed in the manifest log; cached per run until on_run_complete, per
-        instance or copy."""
-        if self._manifest_path is None or run_id is None:
-            return False
-        if run_id in self._run_sealed:
-            return self._run_sealed[run_id]
-        try:
-            found = _is_run_sealed_unverified(self._manifest_path, run_id, self._seal_index_path)
-        except OSError as exc:
-            logger.warning(
-                "AuditExtender: could not read manifest_path %s for run_id %r (%s); calculations under it "
-                "are audited without the sealed-run check",
-                self._manifest_path,
-                run_id,
-                type(exc).__name__,
-            )
-            self._run_sealed[run_id] = False
-            return False
-        self._run_sealed[run_id] = found
-        return found
 
     def _missing_identity(self, context: HookContext | RunContext) -> list[str]:
         return [name for name in self.required_identity if _is_blank(getattr(context, name))]
 
     def _build_record(
-        self, context: HookContext, loads: list[tuple[str, str | None]], *, status: str | None, error_type: str | None
+        self,
+        context: HookContext,
+        loads: list[tuple[str, str | None, bool | None]],
+        *,
+        status: str | None,
+        error_type: str | None,
     ) -> dict[str, Any]:
         per_call: dict[str, Any] = {
             "feature_group_class": context.feature_group_class,
@@ -675,7 +643,7 @@ class AuditExtender(Extender):
         run_id: str | None,
         plan_id: str | None,
         per_call: dict[str, Any],
-        loads: list[tuple[str, str | None]],
+        loads: list[tuple[str, str | None, bool | None]],
         status: str | None,
         error_type: str | None,
     ) -> dict[str, Any]:
@@ -696,6 +664,7 @@ class AuditExtender(Extender):
             **per_call,
             "status": status,
             "error_type": error_type,
-            "data_access_identity": [identity for identity, _ in loads],
-            "data_access_format": [fmt for _, fmt in loads],
+            "data_access_identity": [identity for identity, _, _ in loads],
+            "data_access_format": [fmt for _, fmt, _ in loads],
+            "data_access_identity_is_fallback": [flag for _, _, flag in loads],
         }
