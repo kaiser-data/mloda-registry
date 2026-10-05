@@ -48,8 +48,12 @@ result_2 = session.run(api_data={"MyKey": {"col": [3, 4]}})
 
 `session.run()` accepts additional parameters beyond `api_data`:
 
-- `parallelization_modes` — Override parallelization per run
-- `flight_server` — Arrow Flight server for distributed execution
+- `parallelization_modes`: override parallelization per run
+- `flight_server`: Arrow Flight server for distributed execution
+- `artifacts`: a previous run's `get_artifacts()`; matching feature groups switch to load mode
+- `carrier`: W3C trace-context carrier forwarded to every hook context; may differ per call
+- `child_bootstrap`: picklable no-argument callable run once in each `MULTIPROCESSING` worker before its first command
+- `graceful_shutdown_timeout`: seconds (default 2.0), shared by a `MULTIPROCESSING` worker's extenders, for their `close()` before the worker is terminated, see [Pickle Compatibility](../11-create-extender.md#pickle-compatibility)
 
 Extenders are not a `session.run()` parameter (passing `function_extender` there raises `TypeError`). Pass them to `mloda.prepare(...)` instead; they apply to every `session.run()` of that session:
 
