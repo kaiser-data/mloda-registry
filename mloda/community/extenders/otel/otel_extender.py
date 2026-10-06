@@ -20,6 +20,7 @@ from mloda.steward import (
     RunContext,
     WarnOncePerInstance,
     pickle_failure_reason,
+    scrub_credentials,
 )
 from opentelemetry import trace
 from opentelemetry.context import Context
@@ -59,9 +60,66 @@ _SpanInts = tuple[int, int, int]  # (trace_id, span_id, trace_flags)
 # from a run_id (no real parent span was ever created; only the deterministic trace_id matters here).
 _RUN_ID_PARENT_SPAN_ID = 0x0000000000000001
 
+
+# reprlib keeps only a short head and tail, so only the ends of a long text need scrubbing; the window
+# is large enough to hold a presigned URL with a session token.
+_SCRUB_WINDOW = 8192
+_SECRET_KEY_TAIL = 64
+
+
+def _scrub_ends(text: str) -> str:
+    if len(text) <= 2 * _SCRUB_WINDOW:
+        return scrub_credentials(text)
+    return scrub_credentials(text[:_SCRUB_WINDOW]) + " " + scrub_credentials(text[-_SCRUB_WINDOW:])
+
+
+def _is_secret_key(key: object) -> bool:
+    if not isinstance(key, str):
+        return False
+    probe = f"{key[-_SECRET_KEY_TAIL:]}=x"
+    return scrub_credentials(probe) != probe
+
+
+def _sorted_if_possible(keys: list[Any]) -> list[Any]:
+    try:
+        return sorted(keys)
+    except TypeError:
+        return keys
+
+
+# Scrubs before reprlib's cut and redacts values under secret-named dict keys.
+class _ScrubbingRepr(reprlib.Repr):
+    def repr_str(self, x: str, level: int) -> str:
+        return super().repr_str(_scrub_ends(x), level)
+
+    def repr_dict(self, x: dict[Any, Any], level: int) -> str:
+        if not x:
+            return "{}"
+        if level <= 0:
+            return "{...}"
+        pieces = []
+        for key in _sorted_if_possible(list(x))[: self.maxdict]:
+            value_repr = "'***'" if _is_secret_key(key) else self.repr1(x[key], level - 1)
+            pieces.append("%s: %s" % (self.repr1(key, level - 1), value_repr))
+        if len(x) > self.maxdict:
+            pieces.append("...")
+        return "{" + ", ".join(pieces) + "}"
+
+    def repr_instance(self, x: object, level: int) -> str:
+        try:
+            s = _scrub_ends(repr(x))
+        except Exception:
+            return "<%s instance at %#x>" % (x.__class__.__name__, id(x))
+        if len(s) > self.maxother:
+            i = max(0, (self.maxother - 3) // 2)
+            j = max(0, self.maxother - 3 - i)
+            s = s[:i] + "..." + s[len(s) - j :]
+        return s
+
+
 # Bounded repr for content previews: only recurses into the first N elements of a container,
 # so it never materializes a full repr/str of a huge result before truncation (see _content_preview).
-_BOUNDED_REPR = reprlib.Repr()
+_BOUNDED_REPR = _ScrubbingRepr()
 _BOUNDED_REPR.maxlevel = 3
 _BOUNDED_REPR.maxlist = 10
 _BOUNDED_REPR.maxdict = 10
@@ -361,7 +419,7 @@ class OtelExtender(Extender):
     def _content_preview(self, result: Any) -> str:
         assert self.mask is not None
         value = self.mask(result)
-        return _BOUNDED_REPR.repr(value)[:_CONTENT_PREVIEW_MAX_LEN]
+        return scrub_credentials(_BOUNDED_REPR.repr(value))[:_CONTENT_PREVIEW_MAX_LEN]
 
 
 def _ints(span_context: SpanContext) -> _SpanInts:
